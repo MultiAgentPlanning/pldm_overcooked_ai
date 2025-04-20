@@ -1,7 +1,9 @@
+seed: 101
 data:
   train_data_path: /scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv
   val_data_path: null
   val_ratio: 0.1
+  test_ratio: 0.1
   max_samples: null
 model:
   type: grid
@@ -13,16 +15,23 @@ model:
   grid_height: 5
   grid_width: 13
 training:
-  output_dir: /scratch/hs5580/ddrl/overcooked/models/grid_model
+  output_dir: ./models/grid_default
   batch_size: 64
-  learning_rate: 1e-4
-  dynamics_epochs: 10
-  reward_epochs: 5
-  log_interval: 10
-  num_workers: 4
+  learning_rate: 0.0001
+  dynamics_epochs: 200
+  reward_epochs: 100
+  log_interval: 50
+  num_workers: 8
   device: auto
+  max_iterations: 1000
+  max_steps: 500
 testing:
   test_data_path: null
   num_samples: 100
-  planning_horizon: 100
+  planning_horizon: 400
   planning_samples: 100
+wandb:
+  use_wandb: true
+  project: rl-overcooked
+  name: grid_default
+  entity: harshsutariya1179

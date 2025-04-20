@@ -16,7 +16,7 @@ from solution.pldm import (
     load_config, get_default_config, merge_configs
 )
 from solution.test_pldm import load_models # Reuse model loading logic
-from solution.pldm.utils import parse_state, index_to_action_name
+from solution.pldm.utils import parse_state, index_to_action_name, set_seeds
 
 
 def get_sample_state(data_path):
@@ -50,6 +50,8 @@ def main():
                         help="Number of action sequences to sample for planning")
     parser.add_argument("--device", type=str,
                         help="Device to use for planning ('auto', 'cuda', 'cpu', overrides config)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducible action sampling")
 
     args = parser.parse_args()
 
@@ -79,6 +81,13 @@ def main():
     else:
         device = torch.device(device_str)
     print(f"Using device: {device}")
+    
+    # --- Set Random Seed if Provided ---
+    # Check config first, but command-line arg has priority
+    seed = args.seed if args.seed is not None else config.get("seed")
+    if seed is not None:
+        print(f"Setting random seed to {seed} (from {'command-line' if args.seed is not None else 'config'})")
+        set_seeds(seed)
 
     # --- 3. Load Models --- 
     print(f"Loading models from: {model_dir}")
@@ -101,7 +110,8 @@ def main():
         num_actions=num_actions,
         planning_horizon=args.horizon,
         num_samples=args.samples,
-        device=device
+        device=device,
+        seed=seed
     )
 
     # --- 5. Get a Sample State --- 

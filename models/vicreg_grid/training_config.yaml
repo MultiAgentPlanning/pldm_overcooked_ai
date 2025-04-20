@@ -13,16 +13,29 @@ model:
   grid_height: 5
   grid_width: 13
 training:
-  output_dir: /scratch/hs5580/ddrl/overcooked/models/grid_model
+  output_dir: /scratch/hs5580/ddrl/overcooked/models/vicreg_grid
   batch_size: 64
-  learning_rate: 1e-4
-  dynamics_epochs: 10
-  reward_epochs: 5
-  log_interval: 10
-  num_workers: 4
+  learning_rate: 0.0001
+  dynamics_epochs: 200
+  reward_epochs: 100
+  log_interval: 50
+  num_workers: 8
   device: auto
+  use_vicreg: true
+vicreg:
+  sim_coeff: 25.0
+  std_coeff: 25.0
+  cov_coeff: 1.0
+  std_margin: 1.0
+  mse_coeff: 1.0
+  projection_dim: 256
+  use_projector: true
 testing:
   test_data_path: null
   num_samples: 100
   planning_horizon: 100
   planning_samples: 100
+wandb:
+  project: rl-overcooked-vicreg
+  name: vicreg_grid_model
+  entity: harshsutariya1179

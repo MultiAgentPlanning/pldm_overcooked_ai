@@ -11,7 +11,7 @@ import pandas as pd
 # Add the parent directory to the path so we can import the pldm module
 sys.path.append(str(Path(__file__).parent.parent))
 
-from solution.pldm.utils import parse_state, parse_joint_action, get_action_index
+from solution.pldm.utils import parse_state, parse_joint_action, get_action_index, set_seeds
 from solution.pldm.state_encoder import GridStateEncoder, VectorStateEncoder
 from solution.pldm.dynamics_predictor import GridDynamicsPredictor, VectorDynamicsPredictor
 from solution.pldm.reward_predictor import GridRewardPredictor, VectorRewardPredictor
@@ -256,7 +256,7 @@ def get_actual_cumulative_reward(dataset: OvercookedDataset, start_idx: int, hor
     return cumulative_reward
 
 
-def evaluate_models(data_path, model_dir, num_samples=100, planning_horizon=10, planning_samples=50, device=None):
+def evaluate_models(data_path, model_dir, num_samples=100, planning_horizon=10, planning_samples=50, device=None, seed=None):
     """
     Evaluate the dynamics, reward, and planning models on a subset of the data.
     
@@ -267,7 +267,13 @@ def evaluate_models(data_path, model_dir, num_samples=100, planning_horizon=10, 
         planning_horizon: Horizon H for the planner's simulation.
         planning_samples: Number of trajectories the planner samples.
         device: Device to use for evaluation
+        seed: Random seed for reproducibility
     """
+    # Set seeds for reproducibility if provided
+    if seed is not None:
+        print(f"Setting random seed to {seed}")
+        set_seeds(seed)
+    
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -292,22 +298,44 @@ def evaluate_models(data_path, model_dir, num_samples=100, planning_horizon=10, 
         num_actions=num_actions,
         planning_horizon=planning_horizon,
         num_samples=planning_samples,
-        device=device
+        device=device,
+        seed=seed  # Pass the seed to the planner
     )
     print("Planner initialized.")
 
-    # --- Load Test Data --- 
-    # We need the raw dataset access to get state dicts for the planner
+    # --- Load Full Dataset for Accurate Episode Info ---
+    print("Loading full dataset for episode boundary calculation...")
+    try:
+        full_dataset = OvercookedDataset(
+            data_path=data_path,
+            state_encoder_type=hparams['model_type'],
+            max_samples=None # Load everything
+        )
+        print(f"Full dataset loaded with {len(full_dataset)} transitions.")
+        if not hasattr(full_dataset, 'episode_info') or not full_dataset.episode_info:
+             print("Warning: Full dataset loaded but failed to compute episode info.")
+             # Decide how to handle this - maybe proceed without actual reward calculation?
+             # For now, we'll let get_actual_cumulative_reward handle the None case.
+             pass
+    except Exception as e:
+        print(f"Error loading full dataset: {e}. Cannot calculate actual rewards accurately.")
+        return # Exit if we can't get episode info
+
+    # Determine the actual number of samples to evaluate
+    num_eval_samples = min(num_samples, len(full_dataset))
+    print(f"Evaluating on {num_eval_samples} starting states...")
+    eval_indices = range(num_eval_samples) # Use these indices for sampling
+
+    # --- Load Test Data (Subset for iteration - potentially remove later if not needed) ---
+    # We still need the raw dataset access to get state dicts for the planner
     # and potentially sequences for actual reward calculation
-    print("Loading test dataset...")
-    # Note: OvercookedDataset might need modification if we need sequences directly.
-    # For now, we use it to get initial states.
-    test_dataset = OvercookedDataset(
-        data_path=data_path,
-        state_encoder_type=hparams['model_type'],
-        max_samples=num_samples # Load only the required number of start states
-    )
-    print(f"Dataset loaded with {len(test_dataset)} samples.")
+    # print("Loading test dataset subset (if needed)...")
+    # test_dataset = OvercookedDataset(
+    #     data_path=data_path,
+    #     state_encoder_type=hparams['model_type'],
+    #     max_samples=num_samples # Load only the required number of start states
+    # )
+    # print(f"Subset dataset loaded with {len(test_dataset)} samples.")
     
     # Evaluate models
     dynamics_errors = []
@@ -315,11 +343,11 @@ def evaluate_models(data_path, model_dir, num_samples=100, planning_horizon=10, 
     planner_predicted_rewards = []
     actual_cumulative_rewards = [] # Placeholder
     
-    num_eval_samples = min(num_samples, len(test_dataset))
-    print(f"Evaluating on {num_eval_samples} starting states...")
+    # num_eval_samples = min(num_samples, len(test_dataset)) # Now based on full_dataset length
+    # print(f"Evaluating on {num_eval_samples} starting states...")
     
-    for i in range(num_eval_samples):
-        print(f"Processing sample {i+1}/{num_eval_samples}")
+    for i in eval_indices: # Iterate through the chosen indices
+        print(f"Processing sample index {i} (step {i+1}/{num_eval_samples})")
         # Get the i-th transition from the dataset
         # state_tensor, action_tensor, next_state_tensor, reward_tensor = test_dataset[i]
         
@@ -364,10 +392,9 @@ def evaluate_models(data_path, model_dir, num_samples=100, planning_horizon=10, 
             planned_action_indices, predicted_cumulative_reward = planner.plan(current_state_dict)
             planner_predicted_rewards.append(predicted_cumulative_reward)
 
-            # Get actual cumulative reward from dataset (Requires implementation)
-            # This needs the index `i` mapped back to the original CSV or a dataset structure
-            # that supports sequence retrieval based on episode.
-            actual_reward_h = get_actual_cumulative_reward(test_dataset, i, planning_horizon) 
+            # Get actual cumulative reward from the full dataset instance
+            # Use index `i` which corresponds to the row in the original CSV/full dataset
+            actual_reward_h = get_actual_cumulative_reward(full_dataset, i, planning_horizon) 
             actual_cumulative_rewards.append(actual_reward_h)
 
         except Exception as e:
@@ -434,6 +461,8 @@ def main():
                         help="Planning horizon for MPC evaluation (overrides config's testing.planning_horizon)")
     parser.add_argument("--planning_samples", type=int,
                         help="Number of action sequences to sample for planner evaluation (overrides config's testing.planning_samples)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility")
     
     args = parser.parse_args()
     
@@ -462,6 +491,8 @@ def main():
          override_config.setdefault("testing", {})["planning_horizon"] = args.planning_horizon
     if args.planning_samples is not None:
          override_config.setdefault("testing", {})["planning_samples"] = args.planning_samples
+    if args.seed is not None:
+        override_config.setdefault("testing", {})["seed"] = args.seed
          
     # Merge overrides
     config = merge_configs(config, override_config)
@@ -486,6 +517,11 @@ def main():
     else:
         device = torch.device(device_str)
     
+    # Get seed value from config or command-line arg (command-line has priority)
+    seed = args.seed if args.seed is not None else config.get("seed")
+    if seed is not None:
+        print(f"Using seed from {'command-line' if args.seed is not None else 'config'}: {seed}")
+    
     # Evaluate models, passing planner args from final config
     evaluate_models(
         data_path=test_data_path,
@@ -493,7 +529,8 @@ def main():
         num_samples=num_samples,
         planning_horizon=planning_horizon,
         planning_samples=planning_samples,
-        device=device
+        device=device,
+        seed=seed  # Pass seed to evaluation function
     )
 
 

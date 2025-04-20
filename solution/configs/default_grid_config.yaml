@@ -1,11 +1,15 @@
 # Default configuration file for grid-based PLDM models
 # This configuration uses the grid-based state representation
 
+# General settings
+seed: 101  # Random seed for reproducibility
+
 # Data parameters
 data:
   train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"  # Path to CSV dataset
   val_data_path: null                            # If null, will use a split of train data
   val_ratio: 0.1                                 # Ratio of train data to use for validation
+  test_ratio: 0.1                                # Ratio of train data to use for testing
   max_samples: null                              # Maximum number of samples to use (for testing)
 
 # Model parameters
@@ -21,18 +25,27 @@ model:
 
 # Training parameters
 training:
-  output_dir: "/scratch/hs5580/ddrl/overcooked/models/grid_model"              # Directory to save models and logs
-  batch_size: 64                                 # Batch size for training
-  learning_rate: 1e-4                            # Learning rate
-  dynamics_epochs: 10                            # Number of epochs to train dynamics model
-  reward_epochs: 5                               # Number of epochs to train reward model
-  log_interval: 10                               # Interval for logging training progress
-  num_workers: 4                                 # Number of workers for dataloader
-  device: "auto"                                 # 'auto', 'cuda', or 'cpu'
+  output_dir: ./models/grid_default
+  batch_size: 64
+  learning_rate: 0.0001
+  dynamics_epochs: 200
+  reward_epochs: 100
+  log_interval: 50
+  num_workers: 8
+  device: auto
+  max_iterations: 1000
+  max_steps: 500
 
 # Testing parameters
 testing:
-  test_data_path: null                           # If null, will use training data
-  num_samples: 100                               # Number of samples to evaluate
-  planning_horizon: 100                          # Planning horizon for MPC evaluation
-  planning_samples: 100                          # Number of samples for planner evaluation 
+  test_data_path: null
+  num_samples: 100
+  planning_horizon: 400
+  planning_samples: 100
+
+# WandB parameters
+wandb:
+  use_wandb: true                                # Whether to use WandB logging
+  project: rl-overcooked
+  name: grid_default
+  entity: harshsutariya1179

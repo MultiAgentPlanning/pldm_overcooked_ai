@@ -2,6 +2,8 @@ import json
 import numpy as np
 import torch
 from typing import Dict, List, Tuple, Union, Optional
+import logging
+import sys
 
 # Action mapping constants
 STAY = [0, 0]
@@ -98,6 +100,79 @@ INDEX_TO_ACTION = {
     5: "INTERACT"
 }
 
-def index_to_action_name(index: int) -> str:
-    """Convert an action index back to its name."""
-    return INDEX_TO_ACTION.get(index, "UNKNOWN_ACTION") 
+def index_to_action_name(action_idx):
+    """Convert action index to human-readable name."""
+    action_names = ['STAY', 'UP', 'RIGHT', 'DOWN', 'LEFT', 'INTERACT']
+    if 0 <= action_idx < len(action_names):
+        return action_names[action_idx]
+    return f"UNKNOWN({action_idx})"
+
+def setup_logger(level=logging.INFO, log_file: Optional[str] = None) -> None:
+    """
+    Configures the root logger.
+
+    Args:
+        level: The logging level (e.g., logging.INFO, logging.DEBUG).
+        log_file: Optional path to a file to save logs.
+    """
+    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+    # Get the root logger
+    logger = logging.getLogger()
+    logger.setLevel(level)
+    
+    # Remove existing handlers to avoid duplication if called multiple times
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+        
+    # Create console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    console_handler.setFormatter(logging.Formatter(log_format))
+    logger.addHandler(console_handler)
+    
+    # Create file handler if specified
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, mode='a')
+            file_handler.setLevel(level)
+            file_handler.setFormatter(logging.Formatter(log_format))
+            logger.addHandler(file_handler)
+            logger.info(f"Logging to file: {log_file}")
+        except Exception as e:
+            logger.error(f"Failed to set up log file at {log_file}: {e}")
+
+    logger.info("Logger configured.")
+
+def set_seeds(seed=42):
+    """
+    Set random seeds for reproducibility across Python, NumPy, and PyTorch.
+    
+    Args:
+        seed: Integer seed value to use
+    """
+    import random
+    import numpy as np
+    import torch
+    
+    # Set Python's random seed
+    random.seed(seed)
+    
+    # Set NumPy's random seed
+    np.random.seed(seed)
+    
+    # Set PyTorch's random seeds
+    torch.manual_seed(seed)
+    
+    # Set CUDA's random seeds if available
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # for multi-GPU setups
+        
+        # Additional settings for deterministic CUDA
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    # Return seed in case it's auto-generated in the future
+    return seed 

@@ -6,10 +6,14 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader, random_split
 from typing import Dict, List, Tuple, Union, Optional
+import logging # Import logging
+from tqdm import tqdm # Import tqdm
 
 from .utils import parse_state, parse_joint_action, parse_layout, get_action_index
 from .state_encoder import GridStateEncoder, VectorStateEncoder
 
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 # Custom collate function to handle tensors of different sizes
 def custom_collate_fn(batch):
@@ -101,6 +105,7 @@ class OvercookedDataset(Dataset):
         """
         self.data_path = data_path
         self.state_encoder_type = state_encoder_type
+        logger.info(f"Initializing OvercookedDataset: path={data_path}, type={state_encoder_type}, max_samples={max_samples}")
         
         # Initialize state encoder
         if state_encoder_type == 'grid':
@@ -108,13 +113,14 @@ class OvercookedDataset(Dataset):
         elif state_encoder_type == 'vector':
             self.state_encoder = VectorStateEncoder()
         else:
+            logger.error(f"Unknown state encoder type: {state_encoder_type}")
             raise ValueError(f"Unknown state encoder type: {state_encoder_type}")
         
         # Load and process data
         self.transitions = [] # List to store (state_enc, action_indices, next_state_enc, reward)
         self.episode_info = [] # List to store (start_idx, end_idx, trial_id)
         self._load_data(max_samples)
-        print(f"Loaded {len(self.transitions)} transitions across {len(self.episode_info)} episodes.")
+        logger.info(f"Loaded {len(self.transitions)} transitions across {len(self.episode_info)} episodes.")
     
     def _load_data(self, max_samples: Optional[int] = None):
         """
@@ -133,28 +139,34 @@ class OvercookedDataset(Dataset):
 
         # If simple cache exists, maybe delete it to force regeneration with episode info
         if os.path.exists(simple_cache_path):
-             print(f"Found simple cache {simple_cache_path}. Removing to regenerate with episode info.")
+             logger.info(f"Found simple cache {simple_cache_path}. Removing to regenerate with episode info.")
              try:
                  os.remove(simple_cache_path)
              except OSError as e:
-                 print(f"Error removing cache file: {e}")
+                 logger.error(f"Error removing cache file: {e}")
 
         # --- Start processing --- 
-        print(f"Processing data from {self.data_path} to include episode info.")
+        logger.info(f"Processing data from {self.data_path} to include episode info.")
         current_transition_index = 0
         
         try:
             df = pd.read_csv(self.data_path)
+            # Count trials for tqdm progress bar
+            num_trials = df['trial_id'].nunique()
             trials = df.groupby('trial_id')
             n_trials_processed = 0
             
-            for trial_id, trial_df in trials:
+            # Use tqdm to show progress over trials
+            trial_iterator = tqdm(trials, total=num_trials, desc="Processing Trials", unit="trial")
+
+            for trial_id, trial_df in trial_iterator:
                 # Sort by timestep
                 def extract_timestep(state_json):
                     try:
                         return json.loads(state_json).get("timestep", 0)
                     except json.JSONDecodeError:
-                        return 0 # Handle malformed JSON
+                         logger.warning(f"Malformed JSON found in trial {trial_id}. Returning timestep 0.")
+                         return 0 # Handle malformed JSON
                 
                 trial_df = trial_df.copy()
                 trial_df['extracted_timestep'] = trial_df['state'].apply(extract_timestep)
@@ -192,7 +204,7 @@ class OvercookedDataset(Dataset):
                         num_transitions_in_episode += 1
                         
                     except Exception as row_error:
-                        print(f"Skipping row {i} in trial {trial_id} due to error: {row_error}")
+                        logger.warning(f"Skipping row {i} in trial {trial_id} due to error: {row_error}")
                         continue # Skip problematic rows
 
                     # Break if we have enough total samples
@@ -205,30 +217,34 @@ class OvercookedDataset(Dataset):
                     self.episode_info.append((episode_start_index, episode_end_index, trial_id))
                 
                 n_trials_processed += 1
-                if n_trials_processed % 10 == 0:
-                    print(f"Processed {n_trials_processed} trials, {current_transition_index} transitions")
+                # Update tqdm description
+                trial_iterator.set_description(f"Processed {n_trials_processed}/{num_trials} trials")
+                trial_iterator.set_postfix(transitions=f"{current_transition_index}")
                 
                 # Break outer loop if max_samples reached
                 if max_samples and current_transition_index >= max_samples:
+                    logger.info(f"Reached max_samples ({max_samples}). Stopping data processing.")
                     break
             
+            trial_iterator.close()
             # We are not re-implementing caching here for simplicity.
             # A robust implementation would cache self.transitions and self.episode_info.
             if not self.transitions:
-                 print("Warning: No transitions were loaded after processing.")
+                 logger.warning("No transitions were loaded after processing.")
 
         except FileNotFoundError:
-             print(f"Error: Data file not found at {self.data_path}")
+             logger.error(f"Error: Data file not found at {self.data_path}")
         except Exception as e:
             import traceback
-            print(f"Error processing data: {e}")
-            print(traceback.format_exc())
+            logger.error(f"Error processing data: {e}")
+            logger.error(traceback.format_exc())
             
     def get_episode_info(self, transition_index: int) -> Optional[Tuple[int, int, str]]:
         """Find the episode info (start_idx, end_idx, trial_id) for a given transition index."""
         for start_idx, end_idx, trial_id in self.episode_info:
             if start_idx <= transition_index <= end_idx:
                 return start_idx, end_idx, trial_id
+        logger.warning(f"Could not find episode info for transition index {transition_index}")
         return None # Index out of bounds or not found
 
     def __len__(self):
@@ -250,21 +266,25 @@ def get_overcooked_dataloaders(data_path: str,
                                state_encoder_type: str = 'grid',
                                batch_size: int = 64,
                                val_ratio: float = 0.1,
+                               test_ratio: float = 0.1,
                                max_samples: Optional[int] = None,
-                               num_workers: int = 4) -> Tuple[DataLoader, DataLoader]:
+                               num_workers: int = 4,
+                               seed: Optional[int] = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Create train and validation dataloaders for Overcooked data.
+    Create train, validation, and test dataloaders for Overcooked data.
     
     Args:
         data_path: Path to CSV dataset
         state_encoder_type: Type of state encoder ('grid' or 'vector') 
         batch_size: Batch size for dataloaders
-        val_ratio: Ratio of data to use for validation
+        val_ratio: Ratio of data to use for validation (default: 0.1)
+        test_ratio: Ratio of data to use for testing (default: 0.1)
         max_samples: Maximum number of samples to load (optional, for testing)
         num_workers: Number of workers for dataloader
+        seed: Random seed for reproducible dataset splitting
     
     Returns:
-        Tuple of (train_loader, val_loader)
+        Tuple of (train_loader, val_loader, test_loader)
     """
     # Create dataset
     dataset = OvercookedDataset(data_path, state_encoder_type, max_samples)
@@ -273,11 +293,26 @@ def get_overcooked_dataloaders(data_path: str,
     if len(dataset) == 0:
         raise ValueError("Dataset is empty! No transitions were loaded from the data file.")
     
-    # Split into train and validation
+    # Calculate sizes for each split
+    test_size = max(1, int(test_ratio * len(dataset)))
     val_size = max(1, int(val_ratio * len(dataset)))
-    train_size = len(dataset) - val_size
+    train_size = len(dataset) - val_size - test_size
     
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # Use the generator from torch for reproducible splits if seed is provided
+    generator = None
+    if seed is not None:
+        generator = torch.Generator().manual_seed(seed)
+        logger.info(f"Using seed {seed} for dataset splitting")
+    
+    # Split into train, validation, and test datasets
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, 
+        [train_size, val_size, test_size], 
+        generator=generator
+    )
+    
+    # Log split information
+    logger.info(f"Dataset split: {len(train_dataset)} train, {len(val_dataset)} validation, {len(test_dataset)} test samples")
     
     # Create dataloaders with custom collate function
     train_loader = DataLoader(
@@ -298,4 +333,13 @@ def get_overcooked_dataloaders(data_path: str,
         collate_fn=custom_collate_fn
     )
     
-    return train_loader, val_loader 
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=custom_collate_fn
+    )
+    
+    return train_loader, val_loader, test_loader 

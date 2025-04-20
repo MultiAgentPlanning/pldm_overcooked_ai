@@ -61,11 +61,15 @@ def get_default_config() -> Dict[str, Any]:
         Dictionary containing default configuration parameters
     """
     return {
+        # General settings
+        "seed": 42,  # Random seed for reproducibility
+        
         # Data parameters
         "data": {
             "train_data_path": "../data/2020_hh_trials.csv",
             "val_data_path": None,  # If None, will use a split of train data
             "val_ratio": 0.1,       # Ratio of train data to use for validation if val_data_path is None
+            "test_ratio": 0.1,      # Ratio of train data to use for testing
             "max_samples": None,    # Maximum number of samples to use (for testing)
         },
         
@@ -99,6 +103,14 @@ def get_default_config() -> Dict[str, Any]:
             "num_samples": 100,      # Number of samples to evaluate
             "planning_horizon": 100, # Default planning horizon for evaluation
             "planning_samples": 100  # Default number of samples for planner evaluation
+        },
+
+        # WandB parameters
+        "wandb": {
+            "use_wandb": False,      # Whether to use WandB logging
+            "project": "pldm-overcooked",
+            "name": None,           # Run name (if None, wandb generates one)
+            "entity": None          # Wandb entity (if None, uses default)
         }
     }
 

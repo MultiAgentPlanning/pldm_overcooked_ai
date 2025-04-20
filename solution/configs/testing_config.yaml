@@ -1,11 +1,15 @@
 # Testing configuration file for PLDM models
 # This configuration is designed for quick testing with a small dataset
 
+# General settings
+seed: 100  # Random seed for reproducibility (using a different seed for testing)
+
 # Data parameters
 data:
   train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"  # Path to CSV dataset
   val_data_path: null                            # If null, will use a split of train data
   val_ratio: 0.1                                 # Ratio of train data to use for validation
+  test_ratio: 0.1                                # Ratio of train data to use for testing
   max_samples: 1000                              # Only use a small subset of data for quick testing
 
 # Model parameters
@@ -33,6 +37,11 @@ training:
 # Testing parameters
 testing:
   test_data_path: null
-  num_samples: 50                                # Fewer samples for quick evaluation
-  planning_horizon: 5                            # Shorter horizon for testing
-  planning_samples: 50                           # Fewer samples for testing 
+  num_samples: 100
+  planning_horizon: 100
+  planning_samples: 100
+
+wandb:
+  use_wandb: false                               # Disable WandB for testing
+  project: "pldm-testing"
+  name: "testing-run" 
