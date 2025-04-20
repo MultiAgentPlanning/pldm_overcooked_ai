@@ -1,0 +1,36 @@
+# Testing configuration file for PLDM models
+# This configuration is designed for quick testing with a small dataset
+
+# Data parameters
+data:
+  train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"  # Path to CSV dataset
+  val_data_path: null                            # If null, will use a split of train data
+  val_ratio: 0.1                                 # Ratio of train data to use for validation
+  max_samples: 1000                              # Only use a small subset of data for quick testing
+
+# Model parameters
+model:
+  type: "grid"                                   # 'grid' or 'vector'
+  state_embed_dim: 64                            # Reduced dimension for faster training
+  action_embed_dim: 4
+  num_actions: 6
+  dynamics_hidden_dim: 128                       # Reduced dimension for faster training
+  reward_hidden_dim: 32                          # Reduced dimension for faster training
+  grid_height: 5
+  grid_width: 13
+
+# Training parameters
+training:
+  output_dir: "/scratch/hs5580/ddrl/overcooked/models/test_model"  # Separate directory for test models
+  batch_size: 32                                 # Smaller batch size for quicker iterations
+  learning_rate: 1e-3                            # Higher learning rate for faster convergence
+  dynamics_epochs: 2                             # Reduced epochs for quick testing
+  reward_epochs: 2                               # Reduced epochs for quick testing
+  log_interval: 5                                # More frequent logging
+  num_workers: 2                                 # Fewer workers to avoid overhead
+  device: "auto"
+
+# Testing parameters
+testing:
+  test_data_path: null
+  num_samples: 50                                # Fewer samples for quick evaluation 

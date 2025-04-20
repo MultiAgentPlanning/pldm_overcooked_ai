@@ -1,0 +1,36 @@
+# Default configuration file for grid-based PLDM models
+# This configuration uses the grid-based state representation
+
+# Data parameters
+data:
+  train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"  # Path to CSV dataset
+  val_data_path: null                            # If null, will use a split of train data
+  val_ratio: 0.1                                 # Ratio of train data to use for validation
+  max_samples: null                              # Maximum number of samples to use (for testing)
+
+# Model parameters
+model:
+  type: "grid"                                   # 'grid' or 'vector'
+  state_embed_dim: 128                           # Dimension of state embedding
+  action_embed_dim: 4                            # Dimension of action embedding
+  num_actions: 6                                 # Number of possible actions
+  dynamics_hidden_dim: 256                       # Hidden dimension for dynamics predictor
+  reward_hidden_dim: 64                          # Hidden dimension for reward predictor
+  grid_height: 5                                 # Height of the grid
+  grid_width: 13                                 # Width of the grid
+
+# Training parameters
+training:
+  output_dir: "/scratch/hs5580/ddrl/overcooked/models/grid_model"              # Directory to save models and logs
+  batch_size: 64                                 # Batch size for training
+  learning_rate: 1e-4                            # Learning rate
+  dynamics_epochs: 10                            # Number of epochs to train dynamics model
+  reward_epochs: 5                               # Number of epochs to train reward model
+  log_interval: 10                               # Interval for logging training progress
+  num_workers: 4                                 # Number of workers for dataloader
+  device: "auto"                                 # 'auto', 'cuda', or 'cpu'
+
+# Testing parametersls
+testing:
+  test_data_path: null                           # If null, will use training data
+  num_samples: 100                               # Number of samples to evaluate 

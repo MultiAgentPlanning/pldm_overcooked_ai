@@ -1,0 +1,36 @@
+# Configuration file for vector-based PLDM models
+# This configuration uses the vector-based state representation
+
+# Data parameters
+data:
+  train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"  # Path to CSV dataset
+  val_data_path: null                            # If null, will use a split of train data
+  val_ratio: 0.1                                 # Ratio of train data to use for validation
+  max_samples: null                              # Maximum number of samples to use (for testing)
+
+# Model parameters
+model:
+  type: "vector"                                 # 'grid' or 'vector'
+  state_embed_dim: 128                           # Dimension of state embedding
+  action_embed_dim: 4                            # Dimension of action embedding
+  num_actions: 6                                 # Number of possible actions
+  dynamics_hidden_dim: 192                       # Hidden dimension for dynamics predictor (smaller for vector model)
+  reward_hidden_dim: 64                          # Hidden dimension for reward predictor
+  grid_height: 5                                 # Height of the grid (still needed for state encoding)
+  grid_width: 13                                 # Width of the grid (still needed for state encoding)
+
+# Training parameters
+training:
+  output_dir: "/scratch/hs5580/ddrl/overcooked/models/vector_model"  # Directory to save models and logs
+  batch_size: 64                                 # Batch size for training
+  learning_rate: 5e-4                            # Learning rate (slightly higher for vector model)
+  dynamics_epochs: 15                            # Number of epochs to train dynamics model (more for vector model)
+  reward_epochs: 8                               # Number of epochs to train reward model
+  log_interval: 10                               # Interval for logging training progress
+  num_workers: 4                                 # Number of workers for dataloader
+  device: "auto"                                 # 'auto', 'cuda', or 'cpu'
+
+# Testing parameters
+testing:
+  test_data_path: null                           # If null, will use training data
+  num_samples: 100                               # Number of samples to evaluate 
