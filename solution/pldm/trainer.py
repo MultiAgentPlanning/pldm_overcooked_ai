@@ -184,9 +184,14 @@ class PLDMTrainer:
         self.dynamics_optimizer = optim.Adam(self.dynamics_model.parameters(), lr=self.lr)
         self.reward_optimizer = optim.Adam(self.reward_model.parameters(), lr=self.lr)
         
+        # Print the size of the model to verify
+        total_dynamics_params = sum(p.numel() for p in self.dynamics_model.parameters() if p.requires_grad)
+        total_reward_params = sum(p.numel() for p in self.reward_model.parameters() if p.requires_grad)
+        
         print(f"Initialized {self.model_type} models with grid size {self.grid_height}x{self.grid_width}")
         print(f"Dynamics model: {self.dynamics_model}")
         print(f"Reward model: {self.reward_model}")
+        print(f"Total trainable parameters - Dynamics: {total_dynamics_params:,}, Reward: {total_reward_params:,}")
     
     def train_episode(self, episode_data):
         """

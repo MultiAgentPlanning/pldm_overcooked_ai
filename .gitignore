@@ -2,3 +2,5 @@
 *.npz
 .empty
 __pycache__
+*.pt
+*.png

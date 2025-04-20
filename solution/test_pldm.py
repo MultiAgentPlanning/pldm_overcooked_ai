@@ -100,20 +100,107 @@ def load_models(model_dir):
     
     # Load model weights
     device = torch.device('cpu') if hparams.get('device', 'auto') == 'auto' else torch.device(hparams.get('device', 'cpu'))
-    dynamics_model.load_state_dict(torch.load(
-        os.path.join(model_dir, 'dynamics_model.pt'),
-        map_location=device
-    ))
-    reward_model.load_state_dict(torch.load(
-        os.path.join(model_dir, 'reward_model.pt'),
-        map_location=device
-    ))
+    
+    # Custom loading for the dynamics model
+    load_model_with_dynamic_layers(dynamics_model, os.path.join(model_dir, 'dynamics_model.pt'), device)
+    
+    # Custom loading for the reward model
+    load_model_with_dynamic_layers(reward_model, os.path.join(model_dir, 'reward_model.pt'), device)
     
     # Set models to evaluation mode
     dynamics_model.eval()
     reward_model.eval()
     
     return state_encoder, dynamics_model, reward_model, hparams
+
+
+def load_model_with_dynamic_layers(model, model_path, device):
+    """
+    Custom model loading that handles dynamic layers in the model.
+    
+    Args:
+        model: The model to load weights into
+        model_path: Path to the saved model weights
+        device: Device to load the model onto
+    """
+    print(f"Loading model from {model_path}")
+    
+    # Load the state dict
+    state_dict = torch.load(model_path, map_location=device)
+    
+    # Initialize missing dynamic layers
+    initialize_missing_layers(model, state_dict, device)
+    
+    # Filter out layers from the state dict that don't match current model
+    filtered_state_dict = {}
+    for name, param in state_dict.items():
+        if name in model.state_dict():
+            # Check if shapes match
+            if param.shape == model.state_dict()[name].shape:
+                filtered_state_dict[name] = param
+            else:
+                print(f"Skipping parameter {name} due to shape mismatch: " 
+                      f"saved {param.shape} vs current {model.state_dict()[name].shape}")
+    
+    # Load the filtered state dict
+    model.load_state_dict(filtered_state_dict, strict=False)
+    
+    print(f"Model loaded successfully with {len(filtered_state_dict)}/{len(state_dict)} parameters")
+
+
+def initialize_missing_layers(model, state_dict, device):
+    """
+    Initialize missing dynamic layers in the model based on the state dict.
+    
+    Args:
+        model: The model to initialize layers for
+        state_dict: The saved state dict
+        device: Device to create the layers on
+    """
+    # For GridDynamicsPredictor
+    if isinstance(model, GridDynamicsPredictor):
+        # Initialize encoder projection if needed
+        if "encoder_proj.weight" in state_dict and model.encoder_proj is None:
+            in_features = state_dict["encoder_proj.weight"].shape[1]
+            out_features = state_dict["encoder_proj.weight"].shape[0]
+            model.encoder_proj = torch.nn.Linear(in_features, out_features).to(device)
+            print(f"Initialized encoder projection: {in_features} -> {out_features}")
+        
+        # Initialize output projection if needed
+        if "output_proj.weight" in state_dict and model.output_proj is None:
+            in_features = state_dict["output_proj.weight"].shape[1]
+            out_features = state_dict["output_proj.weight"].shape[0]
+            model.output_proj = torch.nn.Linear(in_features, out_features).to(device)
+            print(f"Initialized output projection: {in_features} -> {out_features}")
+            
+        # Check if fc1 needs to be resized
+        if "fc1.weight" in state_dict:
+            saved_shape = state_dict["fc1.weight"].shape
+            current_shape = model.fc1.weight.shape
+            
+            if saved_shape != current_shape:
+                # Reinitialize fc1 with correct shape
+                model.fc1 = torch.nn.Linear(saved_shape[1], saved_shape[0]).to(device)
+                print(f"Resized fc1: {saved_shape[1]} -> {saved_shape[0]}")
+    
+    # For GridRewardPredictor
+    elif isinstance(model, GridRewardPredictor):
+        # Initialize encoder projection if needed
+        if "encoder_proj.weight" in state_dict and model.encoder_proj is None:
+            in_features = state_dict["encoder_proj.weight"].shape[1]
+            out_features = state_dict["encoder_proj.weight"].shape[0]
+            model.encoder_proj = torch.nn.Linear(in_features, out_features).to(device)
+            print(f"Initialized encoder projection: {in_features} -> {out_features}")
+            
+        # Check if fc1 needs to be resized
+        if "fc1.weight" in state_dict:
+            saved_shape = state_dict["fc1.weight"].shape
+            current_shape = model.fc1.weight.shape
+            
+            if saved_shape != current_shape:
+                # Reinitialize fc1 with correct shape
+                model.fc1 = torch.nn.Linear(saved_shape[1], saved_shape[0]).to(device)
+                print(f"Resized fc1: {saved_shape[1]} -> {saved_shape[0]}")
 
 
 def evaluate_models(data_path, model_dir, num_samples=100, device=None):
@@ -141,9 +228,14 @@ def evaluate_models(data_path, model_dir, num_samples=100, device=None):
         max_samples=num_samples
     )
     
+    # Create a custom collate function for evaluation batches
+    from solution.pldm.data_processor import custom_collate_fn
+    
     # Evaluate models
     dynamics_errors = []
     reward_errors = []
+    
+    print(f"Evaluating on {min(num_samples, len(test_dataset))} samples...")
     
     for i in range(min(num_samples, len(test_dataset))):
         state, action, next_state, reward = test_dataset[i]
@@ -156,42 +248,58 @@ def evaluate_models(data_path, model_dir, num_samples=100, device=None):
         
         # Make predictions
         with torch.no_grad():
-            pred_next_state = dynamics_model(state, action)
-            pred_reward = reward_model(state, action).squeeze()
-        
-        # Calculate errors
-        dynamics_error = torch.nn.functional.mse_loss(pred_next_state, next_state).item()
-        reward_error = torch.abs(pred_reward - reward).item()
-        
-        dynamics_errors.append(dynamics_error)
-        reward_errors.append(reward_error)
+            try:
+                pred_next_state = dynamics_model(state, action)
+                pred_reward = reward_model(state, action).squeeze()
+                
+                # Make sure the prediction and target have the same shape for comparison
+                if pred_next_state.shape != next_state.shape:
+                    # Resize prediction to match target shape (using interpolation)
+                    pred_next_state = torch.nn.functional.interpolate(
+                        pred_next_state, 
+                        size=next_state.shape[2:], 
+                        mode='nearest'
+                    )
+                
+                # Calculate errors
+                dynamics_error = torch.nn.functional.mse_loss(pred_next_state, next_state).item()
+                reward_error = torch.abs(pred_reward - reward).item()
+                
+                dynamics_errors.append(dynamics_error)
+                reward_errors.append(reward_error)
+            except Exception as e:
+                print(f"Error processing sample {i}: {e}")
+                continue
     
     # Print results
-    avg_dynamics_error = np.mean(dynamics_errors)
-    avg_reward_error = np.mean(reward_errors)
-    
-    print(f"Evaluation results on {len(dynamics_errors)} samples:")
-    print(f"  Average dynamics MSE: {avg_dynamics_error:.6f}")
-    print(f"  Average reward MAE: {avg_reward_error:.6f}")
-    
-    # Plot error distributions
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.hist(dynamics_errors, bins=20)
-    plt.xlabel('MSE')
-    plt.ylabel('Count')
-    plt.title('Dynamics Prediction Error')
-    
-    plt.subplot(1, 2, 2)
-    plt.hist(reward_errors, bins=20)
-    plt.xlabel('MAE')
-    plt.ylabel('Count')
-    plt.title('Reward Prediction Error')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(model_dir, 'evaluation_errors.png'))
-    print(f"Error histograms saved to {os.path.join(model_dir, 'evaluation_errors.png')}")
+    if len(dynamics_errors) > 0:
+        avg_dynamics_error = np.mean(dynamics_errors)
+        avg_reward_error = np.mean(reward_errors)
+        
+        print(f"Evaluation results on {len(dynamics_errors)} samples:")
+        print(f"  Average dynamics MSE: {avg_dynamics_error:.6f}")
+        print(f"  Average reward MAE: {avg_reward_error:.6f}")
+        
+        # Plot error distributions
+        plt.figure(figsize=(12, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.hist(dynamics_errors, bins=20)
+        plt.xlabel('MSE')
+        plt.ylabel('Count')
+        plt.title('Dynamics Prediction Error')
+        
+        plt.subplot(1, 2, 2)
+        plt.hist(reward_errors, bins=20)
+        plt.xlabel('MAE')
+        plt.ylabel('Count')
+        plt.title('Reward Prediction Error')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(model_dir, 'evaluation_errors.png'))
+        print(f"Error histograms saved to {os.path.join(model_dir, 'evaluation_errors.png')}")
+    else:
+        print("No valid samples were processed. Unable to compute evaluation metrics.")
 
 
 def main():

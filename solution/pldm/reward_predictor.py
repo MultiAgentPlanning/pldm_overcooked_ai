@@ -26,32 +26,21 @@ class GridRewardPredictor(nn.Module):
         self.num_actions = num_actions
         self.hidden_dim = hidden_dim
         
-        # State encoder (CNN) - similar to dynamics predictor
-        self.state_encoder = nn.Sequential(
-            nn.Conv2d(num_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * grid_height * grid_width, 256),
-            nn.ReLU(),
-            nn.Linear(256, state_embed_dim)
-        )
+        # Convolutional layers for state processing
+        self.conv1 = nn.Conv2d(num_channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        
+        # The encoder output projection to state_embed_dim - set dynamically in forward pass
+        self.encoder_proj = None
         
         # Action embedding
         self.action_embedding = ActionEmbedding(num_actions, action_embed_dim)
         
-        # Total input dimension (state + joint action)
+        # Reward prediction network
         total_input_dim = state_embed_dim + 2 * action_embed_dim
-        
-        # Reward prediction network - smaller than dynamics as it's a simpler task
-        self.reward_net = nn.Sequential(
-            nn.Linear(total_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)  # Output a single scalar reward
-        )
+        self.fc1 = nn.Linear(total_input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)  # Output a single scalar reward
     
     def forward(self, state, action_indices):
         """
@@ -64,8 +53,23 @@ class GridRewardPredictor(nn.Module):
         Returns:
             Tensor of shape [batch_size, 1] representing the predicted reward
         """
-        # Encode state
-        state_embed = self.state_encoder(state)
+        batch_size = state.shape[0]
+        
+        # Process through convolutional layers
+        x = F.relu(self.conv1(state))
+        x = F.relu(self.conv2(x))
+        
+        # Flatten the convolutional output
+        flattened_size = x.size(1) * x.size(2) * x.size(3)
+        x = x.view(batch_size, -1)
+        
+        # Create encoder projection layer if needed or if dimensions changed
+        if self.encoder_proj is None or self.encoder_proj.in_features != flattened_size:
+            self.encoder_proj = nn.Linear(flattened_size, self.state_embed_dim).to(state.device)
+            print(f"Reward: Created new encoder projection layer with input size {flattened_size}")
+            
+        # Encode state to fixed dimension
+        state_embed = F.relu(self.encoder_proj(x))
         
         # Encode actions
         action_embed = self.action_embedding(action_indices)
@@ -73,8 +77,18 @@ class GridRewardPredictor(nn.Module):
         # Concatenate state and action embeddings
         combined = torch.cat([state_embed, action_embed], dim=1)
         
-        # Predict reward
-        reward = self.reward_net(combined)
+        # Adjust input size of first FC layer if needed
+        combined_size = combined.size(1)
+        expected_size = self.fc1.in_features
+        
+        if combined_size != expected_size:
+            print(f"Reward: Recreating FC layers. Expected size: {expected_size}, got: {combined_size}")
+            self.fc1 = nn.Linear(combined_size, self.hidden_dim).to(state.device)
+        
+        # Process through fully connected layers
+        x = F.relu(self.fc1(combined))
+        x = F.relu(self.fc2(x))
+        reward = self.fc3(x)
         
         return reward
 
