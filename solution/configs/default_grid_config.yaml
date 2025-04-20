@@ -30,7 +30,9 @@ training:
   num_workers: 4                                 # Number of workers for dataloader
   device: "auto"                                 # 'auto', 'cuda', or 'cpu'
 
-# Testing parametersls
+# Testing parameters
 testing:
   test_data_path: null                           # If null, will use training data
-  num_samples: 100                               # Number of samples to evaluate 
+  num_samples: 100                               # Number of samples to evaluate
+  planning_horizon: 100                          # Planning horizon for MPC evaluation
+  planning_samples: 100                          # Number of samples for planner evaluation 

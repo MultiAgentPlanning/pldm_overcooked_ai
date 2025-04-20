@@ -97,6 +97,8 @@ def get_default_config() -> Dict[str, Any]:
         "testing": {
             "test_data_path": None,  # If None, will use training data
             "num_samples": 100,      # Number of samples to evaluate
+            "planning_horizon": 100, # Default planning horizon for evaluation
+            "planning_samples": 100  # Default number of samples for planner evaluation
         }
     }
 

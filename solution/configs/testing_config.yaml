@@ -33,4 +33,6 @@ training:
 # Testing parameters
 testing:
   test_data_path: null
-  num_samples: 50                                # Fewer samples for quick evaluation 
+  num_samples: 50                                # Fewer samples for quick evaluation
+  planning_horizon: 5                            # Shorter horizon for testing
+  planning_samples: 50                           # Fewer samples for testing 

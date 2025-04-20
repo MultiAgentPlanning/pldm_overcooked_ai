@@ -6,6 +6,7 @@ import numpy as np
 import json
 import matplotlib.pyplot as plt
 from pathlib import Path
+import pandas as pd
 
 # Add the parent directory to the path so we can import the pldm module
 sys.path.append(str(Path(__file__).parent.parent))
@@ -21,6 +22,7 @@ from solution.pldm.config import (
     get_default_config, 
     merge_configs
 )
+from solution.pldm import Planner
 
 
 def load_hyperparameters(model_dir):
@@ -203,103 +205,212 @@ def initialize_missing_layers(model, state_dict, device):
                 print(f"Resized fc1: {saved_shape[1]} -> {saved_shape[0]}")
 
 
-def evaluate_models(data_path, model_dir, num_samples=100, device=None):
+def get_actual_cumulative_reward(dataset: OvercookedDataset, start_idx: int, horizon: int) -> float:
     """
-    Evaluate the dynamics and reward models on a subset of the data.
+    Calculates the actual cumulative reward from the dataset for a given horizon,
+    respecting episode boundaries.
+
+    Args:
+        dataset: The OvercookedDataset instance containing transitions and episode info.
+        start_idx: The starting index in the dataset's flattened transitions list.
+        horizon: The number of steps (transitions) to sum rewards over.
+
+    Returns:
+        The actual cumulative reward (float), or 0.0 if calculation is not possible.
+    """
+    if not hasattr(dataset, 'episode_info') or not hasattr(dataset, 'transitions'):
+        print("Warning: Dataset does not have expected episode_info or transitions. Cannot calculate actual reward.")
+        return 0.0
+
+    # Find the episode this start_idx belongs to
+    episode_data = dataset.get_episode_info(start_idx)
+    if episode_data is None:
+        print(f"Warning: Could not find episode info for start_idx {start_idx}.")
+        return 0.0
+
+    episode_start, episode_end, _ = episode_data
+
+    # Determine how many steps are actually possible within this episode from start_idx
+    steps_left_in_episode = (episode_end - start_idx) + 1 
+    
+    # Determine the effective horizon
+    effective_horizon = min(horizon, steps_left_in_episode)
+    
+    if effective_horizon <= 0:
+        return 0.0
+
+    cumulative_reward = 0.0
+    try:
+        # Sum rewards for the effective horizon
+        for i in range(effective_horizon):
+            # Access the reward from the stored transition tuple (index 3)
+            reward_at_step = dataset.transitions[start_idx + i][3]
+            cumulative_reward += reward_at_step
+    except IndexError:
+        print(f"Warning: Index out of bounds while calculating actual reward. start_idx={start_idx}, effective_horizon={effective_horizon}, dataset_len={len(dataset.transitions)}")
+        return 0.0 # Return 0 if indices go out of bounds
+    except Exception as e:
+        print(f"Warning: Error calculating actual reward: {e}")
+        return 0.0
+
+    return cumulative_reward
+
+
+def evaluate_models(data_path, model_dir, num_samples=100, planning_horizon=10, planning_samples=50, device=None):
+    """
+    Evaluate the dynamics, reward, and planning models on a subset of the data.
     
     Args:
         data_path: Path to the test data
         model_dir: Directory containing the trained models
-        num_samples: Number of samples to evaluate
+        num_samples: Number of samples (start states) to evaluate from the dataset
+        planning_horizon: Horizon H for the planner's simulation.
+        planning_samples: Number of trajectories the planner samples.
         device: Device to use for evaluation
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load models
-    state_encoder, dynamics_model, reward_model, hparams = load_models(model_dir)
-    dynamics_model.to(device)
-    reward_model.to(device)
-    
-    # Load test data
+    # --- Load Models --- 
+    print("Loading models...")
+    try:
+        state_encoder, dynamics_model, reward_model, hparams = load_models(model_dir)
+        dynamics_model.to(device)
+        reward_model.to(device)
+        print("Models loaded.")
+    except Exception as e:
+        print(f"Error loading models: {e}")
+        return
+
+    # --- Initialize Planner --- 
+    print("Initializing planner...")
+    num_actions = hparams.get('num_actions', 6) # Default to 6 if not in hparams
+    planner = Planner(
+        dynamics_model=dynamics_model,
+        reward_model=reward_model,
+        state_encoder=state_encoder,
+        num_actions=num_actions,
+        planning_horizon=planning_horizon,
+        num_samples=planning_samples,
+        device=device
+    )
+    print("Planner initialized.")
+
+    # --- Load Test Data --- 
+    # We need the raw dataset access to get state dicts for the planner
+    # and potentially sequences for actual reward calculation
+    print("Loading test dataset...")
+    # Note: OvercookedDataset might need modification if we need sequences directly.
+    # For now, we use it to get initial states.
     test_dataset = OvercookedDataset(
         data_path=data_path,
         state_encoder_type=hparams['model_type'],
-        max_samples=num_samples
+        max_samples=num_samples # Load only the required number of start states
     )
-    
-    # Create a custom collate function for evaluation batches
-    from solution.pldm.data_processor import custom_collate_fn
+    print(f"Dataset loaded with {len(test_dataset)} samples.")
     
     # Evaluate models
     dynamics_errors = []
     reward_errors = []
+    planner_predicted_rewards = []
+    actual_cumulative_rewards = [] # Placeholder
     
-    print(f"Evaluating on {min(num_samples, len(test_dataset))} samples...")
+    num_eval_samples = min(num_samples, len(test_dataset))
+    print(f"Evaluating on {num_eval_samples} starting states...")
     
-    for i in range(min(num_samples, len(test_dataset))):
-        state, action, next_state, reward = test_dataset[i]
+    for i in range(num_eval_samples):
+        print(f"Processing sample {i+1}/{num_eval_samples}")
+        # Get the i-th transition from the dataset
+        # state_tensor, action_tensor, next_state_tensor, reward_tensor = test_dataset[i]
         
-        # Move tensors to device
-        state = state.to(device).unsqueeze(0)  # Add batch dimension
-        action = action.to(device).unsqueeze(0)
-        next_state = next_state.to(device).unsqueeze(0)
-        reward = reward.to(device)
+        # We need the original state dict for the planner
+        # This requires modifying OvercookedDataset or reloading the raw data here.
+        # ---- TEMPORARY WORKAROUND: Reload raw data for the i-th sample ----
+        try:
+            # TODO: This is inefficient. Dataset should provide state_dict or index mapping.
+            df = pd.read_csv(data_path, skiprows=range(1, i + 1), nrows=1) 
+            if len(df) > 0:
+                current_state_json = df.iloc[0]['state']
+                current_state_dict = parse_state(current_state_json)
+                # Also get actual reward for single-step comparison (optional)
+                # actual_reward = float(df.iloc[0]['reward'])
+            else:
+                 print(f"Warning: Could not read sample {i} from data file.")
+                 continue
+        except Exception as e:
+            print(f"Error reading sample state {i} from {data_path}: {e}")
+            continue
+        # ---- END WORKAROUND ----
         
-        # Make predictions
-        with torch.no_grad():
-            try:
-                pred_next_state = dynamics_model(state, action)
-                pred_reward = reward_model(state, action).squeeze()
-                
-                # Make sure the prediction and target have the same shape for comparison
-                if pred_next_state.shape != next_state.shape:
-                    # Resize prediction to match target shape (using interpolation)
-                    pred_next_state = torch.nn.functional.interpolate(
-                        pred_next_state, 
-                        size=next_state.shape[2:], 
-                        mode='nearest'
-                    )
-                
-                # Calculate errors
-                dynamics_error = torch.nn.functional.mse_loss(pred_next_state, next_state).item()
-                reward_error = torch.abs(pred_reward - reward).item()
-                
-                dynamics_errors.append(dynamics_error)
-                reward_errors.append(reward_error)
-            except Exception as e:
-                print(f"Error processing sample {i}: {e}")
-                continue
+        # --- Single-step model evaluation (Optional - keep if needed) --- 
+        # state = state_tensor.to(device).unsqueeze(0)
+        # action = action_tensor.to(device).unsqueeze(0)
+        # next_state = next_state_tensor.to(device).unsqueeze(0)
+        # reward = reward_tensor.to(device)
+        # with torch.no_grad():
+        #     pred_next_state = dynamics_model(state, action)
+        #     pred_reward = reward_model(state, action).squeeze()
+        #     if pred_next_state.shape != next_state.shape:
+        #          pred_next_state = torch.nn.functional.interpolate(pred_next_state, size=next_state.shape[2:], mode='nearest')
+        #     dynamics_error = torch.nn.functional.mse_loss(pred_next_state, next_state).item()
+        #     reward_error = torch.abs(pred_reward - reward).item()
+        #     dynamics_errors.append(dynamics_error)
+        #     reward_errors.append(reward_error)
+        # --- End single-step evaluation ---
+
+        # --- Planner Evaluation --- 
+        try:
+            # Plan action and get predicted cumulative reward for the best sequence
+            planned_action_indices, predicted_cumulative_reward = planner.plan(current_state_dict)
+            planner_predicted_rewards.append(predicted_cumulative_reward)
+
+            # Get actual cumulative reward from dataset (Requires implementation)
+            # This needs the index `i` mapped back to the original CSV or a dataset structure
+            # that supports sequence retrieval based on episode.
+            actual_reward_h = get_actual_cumulative_reward(test_dataset, i, planning_horizon) 
+            actual_cumulative_rewards.append(actual_reward_h)
+
+        except Exception as e:
+            print(f"Error during planning for sample {i}: {e}")
+            # Append NaN or skip if planning fails
+            planner_predicted_rewards.append(np.nan)
+            actual_cumulative_rewards.append(np.nan)
+            continue
     
-    # Print results
-    if len(dynamics_errors) > 0:
-        avg_dynamics_error = np.mean(dynamics_errors)
-        avg_reward_error = np.mean(reward_errors)
-        
-        print(f"Evaluation results on {len(dynamics_errors)} samples:")
-        print(f"  Average dynamics MSE: {avg_dynamics_error:.6f}")
-        print(f"  Average reward MAE: {avg_reward_error:.6f}")
-        
-        # Plot error distributions
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        plt.hist(dynamics_errors, bins=20)
-        plt.xlabel('MSE')
-        plt.ylabel('Count')
-        plt.title('Dynamics Prediction Error')
-        
-        plt.subplot(1, 2, 2)
-        plt.hist(reward_errors, bins=20)
-        plt.xlabel('MAE')
-        plt.ylabel('Count')
-        plt.title('Reward Prediction Error')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(model_dir, 'evaluation_errors.png'))
-        print(f"Error histograms saved to {os.path.join(model_dir, 'evaluation_errors.png')}")
+    # --- Print Results --- 
+    print("\n--- Evaluation Results ---")
+    # Print single-step results if calculated
+    if dynamics_errors and reward_errors:
+         avg_dynamics_error = np.mean(dynamics_errors)
+         avg_reward_error = np.mean(reward_errors)
+         print(f"Single-Step Model Performance ({len(dynamics_errors)} samples):")
+         print(f"  Average Dynamics MSE: {avg_dynamics_error:.6f}")
+         print(f"  Average Reward MAE: {avg_reward_error:.6f}")
+
+    # Print planner results
+    valid_planner_rewards = [r for r in planner_predicted_rewards if not np.isnan(r)]
+    valid_actual_rewards = [r for r in actual_cumulative_rewards if not np.isnan(r)]
+    num_valid_planner_samples = len(valid_planner_rewards)
+    
+    if num_valid_planner_samples > 0:
+        avg_planner_pred_reward = np.mean(valid_planner_rewards)
+        avg_actual_reward = np.mean(valid_actual_rewards)
+        # Calculate correlation or difference if needed
+        reward_diff = np.mean(np.array(valid_planner_rewards) - np.array(valid_actual_rewards)) if len(valid_actual_rewards) == num_valid_planner_samples else np.nan
+
+        print(f"\nPlanner Performance ({num_valid_planner_samples}/{num_eval_samples} valid samples):")
+        print(f"  Average Predicted Cumulative Reward (H={planning_horizon}): {avg_planner_pred_reward:.4f}")
+        print(f"  Average Actual Cumulative Reward (H={planning_horizon}): {avg_actual_reward:.4f}")
+        print(f"  Average Difference (Predicted - Actual): {reward_diff:.4f}")
     else:
-        print("No valid samples were processed. Unable to compute evaluation metrics.")
+        print("\nPlanner Performance: No valid planner samples processed.")
+
+    # --- Plotting (Optional) --- 
+    # Plot error distributions or planner vs actual rewards if desired
+    # plt.figure(figsize=(12, 5))
+    # ... plotting code ...
+    # plt.savefig(os.path.join(model_dir, 'planner_evaluation.png'))
+    # print(f"Planner evaluation plot saved to {os.path.join(model_dir, 'planner_evaluation.png')}")
 
 
 def main():
@@ -315,9 +426,14 @@ def main():
     parser.add_argument("--model_dir", type=str,
                         help="Directory containing the trained models (overrides config)")
     parser.add_argument("--num_samples", type=int,
-                        help="Number of samples to evaluate (overrides config)")
+                        help="Number of samples to evaluate (overrides config's testing.num_samples)")
     parser.add_argument("--device", type=str,
-                        help="Device to use for evaluation (overrides config)")
+                        help="Device to use for evaluation (overrides config's training.device)")
+    # Planner specific arguments
+    parser.add_argument("--planning_horizon", type=int,
+                        help="Planning horizon for MPC evaluation (overrides config's testing.planning_horizon)")
+    parser.add_argument("--planning_samples", type=int,
+                        help="Number of action sequences to sample for planner evaluation (overrides config's testing.planning_samples)")
     
     args = parser.parse_args()
     
@@ -326,49 +442,42 @@ def main():
     
     # Load config file if provided
     if args.config:
-        loaded_config = load_config(args.config)
-        config = merge_configs(config, loaded_config)
+        try:
+            loaded_config = load_config(args.config)
+            config = merge_configs(config, loaded_config)
+        except FileNotFoundError:
+             print(f"Error: Config file {args.config} not found. Using defaults.")
     
-    # Override config with command-line arguments
+    # Override config with command-line arguments if they were provided
     override_config = {}
-    
-    # Model directory
     if args.model_dir:
-        if "training" not in override_config:
-            override_config["training"] = {}
-        override_config["training"]["output_dir"] = args.model_dir
-    
-    # Data path
+        override_config.setdefault("training", {})["output_dir"] = args.model_dir
     if args.data_path:
-        if "testing" not in override_config:
-            override_config["testing"] = {}
-        override_config["testing"]["test_data_path"] = args.data_path
-    
-    # Number of samples
-    if args.num_samples:
-        if "testing" not in override_config:
-            override_config["testing"] = {}
-        override_config["testing"]["num_samples"] = args.num_samples
-    
-    # Device
+        override_config.setdefault("testing", {})["test_data_path"] = args.data_path
+    if args.num_samples is not None:
+        override_config.setdefault("testing", {})["num_samples"] = args.num_samples
     if args.device:
-        if "training" not in override_config:
-            override_config["training"] = {}
-        override_config["training"]["device"] = args.device
-    
-    # Merge override config with loaded config
+        override_config.setdefault("training", {})["device"] = args.device
+    if args.planning_horizon is not None:
+         override_config.setdefault("testing", {})["planning_horizon"] = args.planning_horizon
+    if args.planning_samples is not None:
+         override_config.setdefault("testing", {})["planning_samples"] = args.planning_samples
+         
+    # Merge overrides
     config = merge_configs(config, override_config)
     
     # Determine model directory
     model_dir = config["training"]["output_dir"]
     
     # Determine data path for testing
-    test_data_path = config["testing"]["test_data_path"]
+    test_data_path = config["testing"].get("test_data_path", None) # Use .get for safety
     if test_data_path is None:
         test_data_path = config["data"]["train_data_path"]
     
-    # Determine number of samples
+    # Determine number of samples and planning parameters from final config
     num_samples = config["testing"]["num_samples"]
+    planning_horizon = config["testing"]["planning_horizon"]
+    planning_samples = config["testing"]["planning_samples"]
     
     # Determine device
     device_str = config["training"]["device"]
@@ -377,11 +486,13 @@ def main():
     else:
         device = torch.device(device_str)
     
-    # Evaluate models
+    # Evaluate models, passing planner args from final config
     evaluate_models(
         data_path=test_data_path,
         model_dir=model_dir,
         num_samples=num_samples,
+        planning_horizon=planning_horizon,
+        planning_samples=planning_samples,
         device=device
     )
 

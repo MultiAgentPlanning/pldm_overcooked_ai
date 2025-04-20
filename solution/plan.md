@@ -171,3 +171,55 @@ Finally, we address how to go from the provided Overcooked dataset (CSV of times
 
 By following these steps, we prepare our data and design our PLDM-like model. In summary, we represent the Overcooked state with appropriate encodings (ensuring both agents and all objects are included), use a joint action encoding, and train a neural network to learn $F(s,a) \to s'$ and $G(s,a) \to r$. This model will then serve as a learned simulator of the Overcooked environment’s dynamics and reward structure ([](https://amslaurea.unibo.it/id/eprint/27600/1/Ferraioli_Valentina_tesi.pdf#:~:text=instance%2C%20the%20model%20can%20predict,interact%20in%20the%20following%20way)), which is particularly useful for planning or training new policies in a model-based reinforcement learning setting. The **joint-agent modeling approach** ensures the model captures the cooperative interactions in this symmetric environment, rather than treating agents in isolation. By using straightforward architectures (fully-connected layers for dynamics and reward, with an optional convolutional state encoder), we can implement this in PyTorch and train it on the provided dataset to accurately mimic the Overcooked-AI environment’s behavior. 
 
+
+# Planning Module Implementation Plan for PLDM in Overcooked-AI
+
+## Objective
+To build an effective **planning component** within a PLDM-like (Planning with Learned Dynamics Model) architecture to select optimal joint-actions for cooperative agents in the Overcooked-AI environment.
+
+## Approach
+
+We propose using a **Model-Predictive Control (MPC)** approach, which involves:
+
+- **Sampling-based Planning**: Use the learned dynamics and reward predictors to simulate multiple future trajectories.
+- **Action Selection**: Evaluate sampled trajectories to select actions maximizing expected cumulative rewards.
+
+## Implementation Steps
+
+### 1. Trajectory Sampling
+- Generate a batch of possible future joint-action sequences.
+- Use stochastic action sampling (e.g., uniform sampling initially, later guided by learned policies).
+
+### 2. Forward Simulation
+- Simulate each trajectory using the trained **Dynamics Predictor** from the PLDM.
+- Predict rewards for each state-action pair in these simulated rollouts using the **Reward Predictor**.
+
+### 3. Evaluation and Selection
+- Calculate cumulative predicted rewards for each trajectory.
+- Select the initial joint-action from the trajectory with the highest cumulative reward as the optimal action to execute.
+
+### 4. Optimization with Cross-Entropy Method (Optional)
+- Initially, use uniform sampling. After baseline implementation, consider incorporating the Cross-Entropy Method (CEM) to iteratively improve action sampling distributions:
+  - Sample trajectories from a distribution over actions.
+  - Keep top trajectories (elite actions).
+  - Fit and update a new action distribution based on elite actions.
+
+## Challenges
+- **Sparse Reward Issue**: Difficulty in differentiating trajectories due to limited immediate feedback.
+  - **Mitigation**: Employ shaped rewards or intrinsic curiosity signals during planning.
+- **Model Prediction Errors**: Accumulating errors in multi-step predictions.
+  - **Mitigation**: Keep planning horizons moderate initially (short to medium length), progressively increasing as the model improves.
+
+## Tools
+- **PyTorch**: Implementing model predictions.
+- **NumPy**: Trajectory sampling and reward calculation.
+- **Parallelization**: Employ batch processing and GPU acceleration for efficient planning simulations.
+
+## Initial Parameters
+- **Planning Horizon**: Start with 5-10 steps initially.
+- **Trajectory Batch Size**: Begin with 50-100 sampled trajectories per planning step.
+- **Action Space**: Discrete joint-action sets for both agents.
+
+## Validation
+- Initially validate planning via manual inspection and baseline comparisons against random or heuristic-based action selections.
+- Progressively evaluate performance improvement through iterative enhancements and CEM integration.

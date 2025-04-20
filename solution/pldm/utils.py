@@ -86,4 +86,18 @@ def get_one_hot(idx: int, size: int) -> np.ndarray:
     """Create a one-hot vector with 1 at the specified index."""
     one_hot = np.zeros(size)
     one_hot[idx] = 1
-    return one_hot 
+    return one_hot
+
+# Add the reverse mapping: index to action name
+INDEX_TO_ACTION = {
+    0: "STAY",
+    1: "UP",
+    2: "DOWN",
+    3: "LEFT",
+    4: "RIGHT",
+    5: "INTERACT"
+}
+
+def index_to_action_name(index: int) -> str:
+    """Convert an action index back to its name."""
+    return INDEX_TO_ACTION.get(index, "UNKNOWN_ACTION") 
