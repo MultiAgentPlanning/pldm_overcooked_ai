@@ -1,0 +1,63 @@
+# Configuration file for probing-only workflow
+# This configuration skips the training and planning phases, only running probing analysis
+
+# General settings
+seed: 42  # Random seed for reproducibility
+
+# Workflow control
+workflow:
+  run_training: false  # Skip training phase
+  run_probing: true    # Enable probing phase  
+  run_planning: false  # Skip planning phase
+
+# Data parameters
+data:
+  train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"
+  val_data_path: null
+  val_ratio: 0.1
+  test_ratio: 0.1
+  max_samples: null
+
+# Model parameters
+model:
+  type: "grid"
+  state_embed_dim: 128
+  action_embed_dim: 4
+  num_actions: 6
+  dynamics_hidden_dim: 256
+  reward_hidden_dim: 64
+  grid_height: 5
+  grid_width: 13
+
+# Training parameters - not used but required for the model structure
+training:
+  output_dir: "/scratch/hs5580/ddrl/overcooked/models/grid_default"  # Point to an existing model directory
+  batch_size: 64
+  learning_rate: 1e-4
+  dynamics_epochs: 10
+  reward_epochs: 5
+  log_interval: 10
+  num_workers: 4
+  device: "auto"
+
+# Probing parameters
+probing:
+  targets: ["state", "reward", "agent_pos"]
+  probe_dynamics: true
+  probe_reward: true
+  hidden_dims: [128, 64]
+  activation: "relu"
+  batch_size: 64
+  epochs: 15  # Increase epochs for more thorough probing
+  lr: 0.001
+  val_ratio: 0.1
+  test_ratio: 0.1
+  visualize: true
+  max_vis_samples: 20
+
+# WandB parameters
+wandb:
+  use_wandb: true
+  project: "pldm-probing"
+  name: "probing_only_analysis"
+  entity: null 

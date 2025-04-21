@@ -79,16 +79,18 @@ class GridDynamicsPredictor(nn.Module):
         # Output layer set dynamically in forward pass
         self.output_proj = None
         
-    def forward(self, state, action_indices):
+    def forward(self, state, action_indices, return_embedding=False):
         """
         Forward pass to predict the next state.
         
         Args:
             state: Tensor of shape [batch_size, channels, height, width]
             action_indices: Tensor of shape [batch_size, 2] with action indices for both agents
+            return_embedding: If True, returns the internal state embedding instead of the next state prediction
             
         Returns:
-            Tensor of shape [batch_size, channels, height, width] representing the predicted next state
+            If return_embedding is False: Tensor of shape [batch_size, channels, height, width] representing the predicted next state
+            If return_embedding is True: Tensor of shape [batch_size, state_embed_dim] representing the state embedding
         """
         batch_size, num_channels, grid_height, grid_width = state.shape
         
@@ -108,6 +110,10 @@ class GridDynamicsPredictor(nn.Module):
             
         # Encode state to fixed dimension
         state_embed = F.relu(self.encoder_proj(x))
+        
+        # If only the embedding is requested, return it here
+        if return_embedding:
+            return state_embed
         
         # Encode actions
         action_embed = self.action_embedding(action_indices)
@@ -173,17 +179,23 @@ class VectorDynamicsPredictor(nn.Module):
             nn.Linear(hidden_dim, state_dim)
         )
     
-    def forward(self, state_vec, action_indices):
+    def forward(self, state_vec, action_indices, return_embedding=False):
         """
         Forward pass to predict the next state.
         
         Args:
             state_vec: Tensor of shape [batch_size, state_dim]
             action_indices: Tensor of shape [batch_size, 2] with action indices for both agents
+            return_embedding: If True, returns the state embedding instead of the next state
             
         Returns:
-            Tensor of shape [batch_size, state_dim] representing the predicted next state
+            If return_embedding is False: Tensor of shape [batch_size, state_dim] representing the predicted next state
+            If return_embedding is True: Tensor of shape [batch_size, state_dim] representing the state embedding
         """
+        # If only the state vector is requested as embedding, return it directly
+        if return_embedding:
+            return state_vec
+            
         # Encode actions
         action_embed = self.action_embedding(action_indices)
         

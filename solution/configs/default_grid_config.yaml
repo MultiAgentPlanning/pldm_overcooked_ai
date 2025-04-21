@@ -4,48 +4,97 @@
 # General settings
 seed: 101  # Random seed for reproducibility
 
+# Workflow control
+workflow:
+  run_training: true   # Enable training phase
+  run_probing: true    # Enable probing phase  
+  run_planning: true   # Enable planning phase
+
 # Data parameters
 data:
-  train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"  # Path to CSV dataset
-  val_data_path: null                            # If null, will use a split of train data
-  val_ratio: 0.1                                 # Ratio of train data to use for validation
-  test_ratio: 0.1                                # Ratio of train data to use for testing
-  max_samples: null                              # Maximum number of samples to use (for testing)
+  train_data_path: "./data/2020_hh_trials.csv"
+  val_data_path: null  # Will use split from train data
+  test_data_path: null  # Will use split from train data
+  val_ratio: 0.1
+  test_ratio: 0.1
+  grid_size: 5
 
 # Model parameters
 model:
-  type: "grid"                                   # 'grid' or 'vector'
-  state_embed_dim: 128                           # Dimension of state embedding
-  action_embed_dim: 4                            # Dimension of action embedding
-  num_actions: 6                                 # Number of possible actions
-  dynamics_hidden_dim: 256                       # Hidden dimension for dynamics predictor
-  reward_hidden_dim: 64                          # Hidden dimension for reward predictor
-  grid_height: 5                                 # Height of the grid
-  grid_width: 13                                 # Width of the grid
+  type: "grid"
+  encoder_type: "cnn"
+  # grid encoder params
+  grid_dims:
+    H: 5
+    W: 5
+  in_channels: 26
+  num_objects: 17
+  hidden_channels: [16, 32, 64]
+  fc_dims: [256, 128]
+  # reward predictor params
+  reward_hidden_dims: [128, 64, 32]
+  reward_activation: "relu"
+  # dynamics predictor params
+  dynamics_hidden_dims: [128, 64, 32]
+  dynamics_activation: "relu"
+  # general params
+  activation: "relu"
+  use_layer_norm: false
+  device: "cuda"
 
 # Training parameters
 training:
-  output_dir: ./models/grid_default
-  batch_size: 64
-  learning_rate: 0.0001
-  dynamics_epochs: 200
-  reward_epochs: 100
-  log_interval: 50
-  num_workers: 8
-  device: auto
-  max_iterations: 1000
-  max_steps: 500
+  batch_size: 128
+  dynamics_epochs: 10
+  reward_epochs: 5
+  learning_rate: 0.001
+  optimizer: "adam"
+  weight_decay: 0.00001
+  scheduler: "plateau"
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+  scheduler_min_lr: 0.000001
+  max_norm: 1.0
+  use_layer_norm: false
+  seed: 42
+  log_interval: 10
+  num_workers: 4
 
 # Testing parameters
 testing:
-  test_data_path: null
+  batch_size: 128
+  use_val_data: false
+  use_test_data: true
   num_samples: 100
-  planning_horizon: 400
+  planning_horizon: 5
   planning_samples: 100
 
 # WandB parameters
 wandb:
-  use_wandb: true                                # Whether to use WandB logging
-  project: rl-overcooked
-  name: grid_default
+  project: "pldm-overcooked"
+  name: base
   entity: harshsutariya1179
+  use_wandb: true  # Disabling WandB due to SSL certificate issues
+  watch_model: true
+  save_model: true
+  
+probing:
+  # Probing targets
+  targets: ["agent_pos"]
+  probe_dynamics: true
+  probe_reward: false
+  
+  # Model parameters
+  hidden_dims: [128, 64]
+  activation: "relu"
+  
+  # Training parameters
+  batch_size: 64
+  epochs: 20
+  lr: 0.001
+  val_ratio: 0.1
+  test_ratio: 0.1
+  
+  # Visualization settings
+  visualize: true
+  max_vis_samples: 10

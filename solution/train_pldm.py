@@ -8,6 +8,7 @@ import json
 import torch
 import numpy as np
 import pandas as pd
+from typing import Dict, Any, Optional
 
 os.environ['WANDB_IGNORE_GLOBS'] = '*.pem'
 os.environ['CURL_CA_BUNDLE'] = ''
@@ -28,6 +29,8 @@ from solution.pldm.utils import setup_logger, set_seeds # Import set_seeds funct
 from solution.pldm.data_processor import OvercookedDataset
 from solution.pldm import Planner
 from solution.pldm.utils import parse_state
+from solution.pldm.prober import Prober, GridProber, VectorProber
+from solution.probe_pldm import ProberEvaluator, ProbeTarget
 
 # Get a logger for this module
 logger = logging.getLogger(__name__)
@@ -53,7 +56,13 @@ def evaluate_planner(config, model_dir, device, wandb_run=None):
     planning_horizon = config["testing"]["planning_horizon"]
     planning_samples = config["testing"]["planning_samples"]
     model_type = config["model"]["type"]
+    
+    # Special handling for seed when using CUDA devices
     seed = config.get("seed", 42)
+    if device.type == 'cuda' and seed is not None:
+        logger.warning("Using a seed with CUDA devices might cause issues with the random generator.")
+        logger.warning("If you encounter 'Expected a 'cuda' device type for generator but found 'cpu'' errors,")
+        logger.warning("the planner.py fix should handle this. If not, try with --seed None or updating PyTorch.")
     
     logger.info(f"Evaluating with planning horizon {planning_horizon}, {planning_samples} samples")
 
@@ -263,6 +272,168 @@ def evaluate_planner(config, model_dir, device, wandb_run=None):
     
     return evaluation_metrics
 
+def run_probing(config, model_dir, device, wandb_run=None):
+    """
+    Run probing analysis on trained models to evaluate their representations.
+    
+    Args:
+        config: The configuration dictionary
+        model_dir: Directory containing the trained models
+        device: Device to use for probing
+        wandb_run: Optional WandB run object for logging results
+    
+    Returns:
+        Dictionary containing probing metrics
+    """
+    logger.info("Starting representation probing analysis...")
+    
+    # Check if probing configuration exists
+    if "probing" not in config:
+        logger.warning("No probing configuration found in config. Using default probing settings.")
+        config["probing"] = get_default_config()["probing"]
+    
+    # Extract probing configuration
+    probing_config = config.get("probing", {})
+    
+    # Set random seed for reproducibility in probing
+    seed = config.get("seed", 42)
+    logger.info(f"Setting probing seed to {seed} for reproducibility")
+    set_seeds(seed)  # This will set seeds for random, numpy, and torch
+    
+    # Check if any targets are specified
+    targets = probing_config.get("targets", [])
+    if not targets:
+        logger.warning("No probing targets specified. Skipping probing.")
+        return {}
+    
+    # Create probing output directory 
+    probing_dir = Path(model_dir) / "probing"
+    os.makedirs(probing_dir, exist_ok=True)
+    
+    # Log probing configuration for reproducibility
+    logger.info(f"Probing configuration: batch_size={probing_config.get('batch_size', 64)}, "
+                f"epochs={probing_config.get('epochs', 10)}, seed={seed}")
+    
+    # Load the saved models using PLDMTrainer
+    try:
+        # Initialize trainer with the saved models
+        trainer = PLDMTrainer(
+            data_path=config["data"]["train_data_path"],
+            output_dir=model_dir,
+            model_type=config["model"]["type"],
+            batch_size=probing_config.get("batch_size", 32),
+            device=device,
+            wandb_run=wandb_run,
+            seed=seed  # Explicitly pass seed to ensure data loaders are consistent
+        )
+        
+        # Load saved models
+        trainer.load_model('dynamics')
+        trainer.load_model('reward')
+        
+        logger.info("PLDM models loaded successfully for probing")
+    except Exception as e:
+        logger.error(f"Error loading models for probing: {e}")
+        return {}
+    
+    # Ensure probing_config has all necessary parameters for ProberEvaluator
+    # Map parameters from config to what ProberEvaluator expects
+    probing_params = {
+        "batch_size": probing_config.get("batch_size", 64),
+        "lr": probing_config.get("lr", 0.001),
+        "epochs": probing_config.get("epochs", 10),
+        "model_type": config["model"]["type"],
+        "data_path": config["data"]["train_data_path"],
+        "max_samples": config["data"].get("max_samples"),
+        "visualize": probing_config.get("visualize", True),
+        "max_vis_samples": probing_config.get("max_vis_samples", 10),
+        "num_workers": config["training"].get("num_workers", 4),
+        "seed": seed  # Ensure seed is explicitly set in params
+    }
+    
+    # Get the models to probe based on config
+    probe_dynamics = probing_config.get("probe_dynamics", True)
+    probe_reward = probing_config.get("probe_reward", True)
+    
+    if not probe_dynamics and not probe_reward:
+        logger.warning("Neither dynamics nor reward model selected for probing. Skipping.")
+        return {}
+    
+    # Initialize prober evaluator
+    prober_evaluator = ProberEvaluator(
+        pldm_trainer=trainer,
+        output_dir=str(probing_dir),
+        config=probing_params,
+        device=device,
+        wandb_run=wandb_run
+    )
+    
+    # Save probing configuration for reproducibility
+    probing_config_path = probing_dir / "probing_config.json"
+    with open(probing_config_path, 'w') as f:
+        json.dump({
+            'seed': seed,
+            'probing_params': probing_params,
+            'targets': targets,
+            'probe_dynamics': probe_dynamics,
+            'probe_reward': probe_reward
+        }, f, indent=2)
+    logger.info(f"Saved probing configuration to {probing_config_path}")
+    
+    # Train and evaluate probers
+    try:
+        logger.info(f"Training and evaluating probers with {probing_params['epochs']} epochs...")
+        logger.info(f"Probing targets: {targets}")
+        
+        # Filter the models to probe based on config
+        results = {}
+        
+        # Define which models to probe
+        models_to_probe = []
+        if probe_dynamics:
+            models_to_probe.append('dynamics')
+        if probe_reward:
+            models_to_probe.append('reward')
+            
+        logger.info(f"Models to probe: {models_to_probe}")
+        
+        # For each model and target, train and evaluate a prober
+        for model_type in models_to_probe:
+            for target in targets:
+                # Skip reward model probing reward (redundant)
+                if model_type == 'reward' and target == ProbeTarget.REWARD:
+                    continue
+                
+                logger.info(f"Probing {model_type} model for {target}")
+                try:
+                    # Set seed again before each probing task for extra reproducibility
+                    set_seeds(seed)
+                    prober = prober_evaluator.train_prober(target, model_type)
+                    metrics = prober_evaluator.evaluate_prober(prober, target, model_type)
+                    results[(model_type, target)] = metrics
+                except Exception as e:
+                    logger.error(f"Error probing {model_type} for {target}: {e}")
+        
+        # Aggregate results
+        if results:
+            prober_evaluator.aggregate_results(results)
+        
+        # Return a summary of the probing results
+        summary_metrics = {}
+        
+        # Extract key metrics from results for overall summary
+        for (model_type, target), metrics in results.items():
+            key = f"probe_{model_type}_{target}"
+            for metric_name, value in metrics.items():
+                summary_metrics[f"{key}_{metric_name}"] = value
+        
+        return summary_metrics
+        
+    except Exception as e:
+        logger.error(f"Error during probing: {e}")
+        logger.exception("Probing exception details:")
+        return {}
+
 def main():
     parser = argparse.ArgumentParser(description="Train PLDM models for Overcooked-AI")
     
@@ -290,6 +461,29 @@ def main():
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility")
 
+    # Workflow control arguments (to override config)
+    parser.add_argument("--run_training", action="store_true", dest="run_training",
+                        help="Run the training phase (overrides config)")
+    parser.add_argument("--no_training", action="store_false", dest="run_training",
+                        help="Skip the training phase (overrides config)")
+    parser.add_argument("--run_probing", action="store_true", dest="run_probing",
+                        help="Run the probing phase (overrides config)")
+    parser.add_argument("--no_probing", action="store_false", dest="run_probing",
+                        help="Skip the probing phase (overrides config)")
+    parser.add_argument("--run_planning", action="store_true", dest="run_planning",
+                        help="Run the planning phase (overrides config)")
+    parser.add_argument("--no_planning", action="store_false", dest="run_planning",
+                        help="Skip the planning phase (overrides config)")
+    
+    # Set default values to None for workflow flags so we can detect if they're explicitly set
+    parser.set_defaults(run_training=None, run_probing=None, run_planning=None)
+
+    # Legacy flags (kept for backward compatibility)
+    parser.add_argument("--skip_evaluation", action="store_true", 
+                        help="[Deprecated] Skip post-training planner evaluation (use --no_planning instead)")
+    parser.add_argument("--skip_probing", action="store_true",
+                        help="[Deprecated] Skip post-training representation probing (use --no_probing instead)")
+    
     # Logging and WandB arguments
     parser.add_argument("--log_level", type=str, default="INFO", 
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -298,8 +492,10 @@ def main():
                         help="Path to save log output to a file.")
     parser.add_argument("--use_wandb", action="store_true", 
                         help="Enable Weights & Biases logging.")
-    parser.add_argument("--skip_evaluation", action="store_true",
-                        help="Skip post-training planner evaluation.")
+    parser.add_argument("--probing_targets", type=str, default=None,
+                        help="Comma-separated list of probing targets (e.g., 'state,reward,agent_pos')")
+    parser.add_argument("--probing_epochs", type=int, default=None,
+                        help="Number of epochs for probing (overrides config)")
     
     args = parser.parse_args()
     
@@ -349,6 +545,30 @@ def main():
     if args.device:
         override_config.setdefault("training", {})["device"] = args.device
     
+    # Override probing settings if provided
+    if args.probing_targets:
+        override_config.setdefault("probing", {})["targets"] = args.probing_targets.split(',')
+    if args.probing_epochs is not None:
+        override_config.setdefault("probing", {})["epochs"] = args.probing_epochs
+    
+    # Override workflow settings if command-line flags were used
+    # Handle workflow settings, prioritizing the new flags over legacy ones
+    workflow_config = override_config.setdefault("workflow", {})
+    
+    # Handle new workflow flags (if explicitly set)
+    if args.run_training is not None:
+        workflow_config["run_training"] = args.run_training
+    if args.run_probing is not None:
+        workflow_config["run_probing"] = args.run_probing
+    if args.run_planning is not None:
+        workflow_config["run_planning"] = args.run_planning
+    
+    # Handle legacy flags (with lower priority than new flags)
+    if args.skip_probing and args.run_probing is None:
+        workflow_config["run_probing"] = False
+    if args.skip_evaluation and args.run_planning is None:
+        workflow_config["run_planning"] = False
+    
     # Apply test settings if --test flag is set
     if args.test:
         logger.info("Applying --test settings (reduced epochs, samples, etc.)")
@@ -375,7 +595,7 @@ def main():
     # Log the final configuration
     logger.debug(f"Final configuration: {json.dumps(config, indent=2)}")
     
-    # Create output directory and save the used configuration
+    # --- Create output directory and save the used configuration
     output_dir = Path(config["training"]["output_dir"])
     try:
         os.makedirs(output_dir, exist_ok=True)
@@ -431,55 +651,117 @@ def main():
         device = torch.device(device_str)
     logger.info(f"Using device: {device}")
 
-    # --- Initialize Trainer --- 
-    logger.info("Initializing PLDMTrainer...")
-    try:
-        trainer = PLDMTrainer(
-            data_path=config["data"]["train_data_path"],
-            output_dir=config["training"]["output_dir"],
-            model_type=config["model"]["type"],
-            batch_size=config["training"]["batch_size"],
-            lr=config["training"]["learning_rate"],
-            state_embed_dim=config["model"]["state_embed_dim"],
-            action_embed_dim=config["model"]["action_embed_dim"],
-            num_actions=config["model"]["num_actions"],
-            dynamics_hidden_dim=config["model"]["dynamics_hidden_dim"],
-            reward_hidden_dim=config["model"]["reward_hidden_dim"],
-            grid_height=config["model"].get("grid_height"), # Use .get for optional params
-            grid_width=config["model"].get("grid_width"),
-            device=device,
-            max_samples=config["data"].get("max_samples"),
-            num_workers=config["training"]["num_workers"],
-            val_ratio=config["data"].get("val_ratio", 0.1),
-            test_ratio=config["data"].get("test_ratio", 0.1),
-            seed=seed,  # Pass the seed for reproducible data splitting
-            # Pass wandb_run object to trainer if needed, or check wandb.run directly
-            wandb_run=wandb_run,
-            disable_artifacts=True  # Disable WandB artifacts to avoid storage errors
-        )
-        logger.info("PLDMTrainer initialized.")
-    except ValueError as ve:
-         logger.error(f"Trainer initialization failed: {ve}")
-         if wandb_run: wandb.finish(exit_code=1)
-         return
-    except Exception as e:
-        logger.exception("An unexpected error occurred during trainer initialization.")
-        if wandb_run: wandb.finish(exit_code=1)
+    # Get workflow settings from config
+    run_training = config["workflow"].get("run_training", True)
+    should_run_probing = config["workflow"].get("run_probing", True)
+    run_planning = config["workflow"].get("run_planning", True)
+    
+    # --- Workflow Summary ---
+    logger.info("\n=== PLDM Workflow ===")
+    logger.info(f"1. Training: {'ENABLED' if run_training else 'DISABLED'}")
+    logger.info(f"2. Probing: {'ENABLED' if should_run_probing else 'DISABLED'}")
+    logger.info(f"3. Planning: {'ENABLED' if run_planning else 'DISABLED'}")
+    logger.info("====================\n")
+    
+    # Only initialize trainer if we're running at least one phase
+    if not (run_training or should_run_probing or run_planning):
+        logger.warning("All workflow phases are disabled. Nothing to do.")
+        if wandb_run:
+            wandb_run.finish()
         return
     
-    # --- Train Models --- 
-    logger.info("Starting model training...")
+    # --- Initialize Trainer if needed ---
+    trainer = None
+    if run_training or should_run_probing:
+        logger.info("Initializing PLDMTrainer...")
+        try:
+            trainer = PLDMTrainer(
+                data_path=config["data"]["train_data_path"],
+                output_dir=config["training"]["output_dir"],
+                model_type=config["model"]["type"],
+                batch_size=config["training"]["batch_size"],
+                lr=config["training"]["learning_rate"],
+                state_embed_dim=config["model"]["state_embed_dim"],
+                action_embed_dim=config["model"]["action_embed_dim"],
+                num_actions=config["model"]["num_actions"],
+                dynamics_hidden_dim=config["model"]["dynamics_hidden_dim"],
+                reward_hidden_dim=config["model"]["reward_hidden_dim"],
+                grid_height=config["model"].get("grid_height"), # Use .get for optional params
+                grid_width=config["model"].get("grid_width"),
+                device=device,
+                max_samples=config["data"].get("max_samples"),
+                num_workers=config["training"]["num_workers"],
+                val_ratio=config["data"].get("val_ratio", 0.1),
+                test_ratio=config["data"].get("test_ratio", 0.1),
+                seed=seed,  # Pass the seed for reproducible data splitting
+                # Pass wandb_run object to trainer if needed, or check wandb.run directly
+                wandb_run=wandb_run,
+                disable_artifacts=True  # Disable WandB artifacts to avoid storage errors
+            )
+            logger.info("PLDMTrainer initialized.")
+        except ValueError as ve:
+             logger.error(f"Trainer initialization failed: {ve}")
+             if wandb_run: wandb.finish(exit_code=1)
+             return
+        except Exception as e:
+            logger.exception("An unexpected error occurred during trainer initialization.")
+            if wandb_run: wandb.finish(exit_code=1)
+            return
+    
+    # --- Run Workflow --- 
     try:
-        trainer.train_all(
-            dynamics_epochs=config["training"]["dynamics_epochs"],
-            reward_epochs=config["training"]["reward_epochs"],
-            log_interval=config["training"]["log_interval"]
-        )
-        logger.info(f"Training complete. Models saved to {config['training']['output_dir']}")
+        # --- 1. Training Phase ---
+        if run_training:
+            logger.info("\n=== PHASE 1: TRAINING ===")
+            logger.info("Starting model training...")
+            trainer.train_all(
+                dynamics_epochs=config["training"]["dynamics_epochs"],
+                reward_epochs=config["training"]["reward_epochs"],
+                log_interval=config["training"]["log_interval"]
+            )
+            logger.info(f"Training complete. Models saved to {config['training']['output_dir']}")
+        elif trainer and not run_training:
+            # If trainer is initialized but training is skipped, we need to load the models
+            try:
+                logger.info("Loading existing models (training phase skipped)...")
+                trainer.load_model('dynamics')
+                trainer.load_model('reward')
+                logger.info("Models loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to load models: {e}")
+                logger.warning("Proceeding without trained models may cause issues in subsequent phases.")
         
-        # Run planner-based evaluation after training (unless skipped)
-        if not args.skip_evaluation:
-            logger.info("Running post-training planner evaluation...")
+        # --- 2. Probing Phase ---
+        if should_run_probing:
+            logger.info("\n=== PHASE 2: PROBING ===")
+            logger.info("Running representation probing...")
+            probing_metrics = run_probing(
+                config=config,
+                model_dir=config["training"]["output_dir"],
+                device=device,
+                wandb_run=wandb_run
+            )
+            
+            # Log a summary of the probing metrics
+            if probing_metrics:
+                logger.info("Representation probing complete.")
+                if wandb_run:
+                    # Create a summary table for WandB
+                    wandb_run.log({
+                        "probing_summary": wandb.Table(
+                            columns=["Metric", "Value"],
+                            data=[[k, v] for k, v in probing_metrics.items()]
+                        )
+                    })
+            else:
+                logger.warning("Probing did not return any metrics.")
+        else:
+            logger.info("\n=== PHASE 2: PROBING (SKIPPED) ===")
+        
+        # --- 3. Planning Phase ---
+        if run_planning:
+            logger.info("\n=== PHASE 3: PLANNING ===")
+            logger.info("Running planner evaluation...")
             eval_metrics = evaluate_planner(
                 config=config,
                 model_dir=config["training"]["output_dir"],
@@ -501,10 +783,12 @@ def main():
             else:
                 logger.warning("Planner evaluation did not return any metrics.")
         else:
-            logger.info("Post-training evaluation skipped.")
+            logger.info("\n=== PHASE 3: PLANNING (SKIPPED) ===")
+        
+        logger.info("\n=== WORKFLOW COMPLETE ===")
             
     except Exception as e:
-        logger.exception("An error occurred during training or evaluation.")
+        logger.exception("An error occurred during workflow execution.")
         if wandb_run: wandb.finish(exit_code=1)
         return
 

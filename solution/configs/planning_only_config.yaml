@@ -1,0 +1,55 @@
+# Configuration file for planning-only workflow
+# This configuration skips the training and probing phases, only running planning evaluation
+
+# General settings
+seed: 42  # Random seed for reproducibility
+
+# Workflow control
+workflow:
+  run_training: false  # Skip training phase
+  run_probing: false   # Skip probing phase  
+  run_planning: true   # Enable planning phase
+
+# Data parameters
+data:
+  train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"
+  val_data_path: null
+  val_ratio: 0.1
+  test_ratio: 0.1
+  max_samples: null
+
+# Model parameters
+model:
+  type: "grid"
+  state_embed_dim: 128
+  action_embed_dim: 4
+  num_actions: 6
+  dynamics_hidden_dim: 256
+  reward_hidden_dim: 64
+  grid_height: 5
+  grid_width: 13
+
+# Training parameters - not used but required for the model structure
+training:
+  output_dir: "/scratch/hs5580/ddrl/overcooked/models/grid_default"  # Point to an existing model directory
+  batch_size: 64
+  learning_rate: 1e-4
+  dynamics_epochs: 10
+  reward_epochs: 5
+  log_interval: 10
+  num_workers: 4
+  device: "auto"
+
+# Testing parameters
+testing:
+  test_data_path: null  # Use the train_data_path
+  num_samples: 100     # Number of samples to evaluate in planning
+  planning_horizon: 400  # Planning horizon (steps ahead to simulate)
+  planning_samples: 100  # Number of action sequences to sample
+
+# WandB parameters
+wandb:
+  use_wandb: true
+  project: "pldm-planning"
+  name: "planning_only_eval"
+  entity: null 

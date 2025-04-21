@@ -47,17 +47,12 @@ class Planner:
         self.horizon = planning_horizon
         self.num_samples = num_samples
         
-        # Set random seed if provided
+        # Store seed for later use
         self.seed = seed
         if seed is not None:
             logger.info(f"Setting planner seed to {seed}")
             set_seeds(seed)
-            # Create a deterministic generator for sampling actions
-            self.rng = torch.Generator()
-            self.rng.manual_seed(seed)
-        else:
-            self.rng = None
-
+        
         # Determine device or use model's device
         if device is not None:
             self.device = device
@@ -68,6 +63,25 @@ class Planner:
             except Exception:
                 logger.warning("Could not infer device from model. Defaulting to CPU.")
                 self.device = torch.device('cpu')
+
+        # Create random generator with the correct device after device is determined
+        if seed is not None:
+            try:
+                # Try creating a generator with the specified device (newer PyTorch versions)
+                self.rng = torch.Generator(device=self.device)
+                self.rng.manual_seed(seed)
+            except (TypeError, RuntimeError) as e:
+                # Fallback for older PyTorch versions or unsupported devices
+                if self.device.type != 'cpu':
+                    logger.warning(f"Cannot create generator on {self.device} due to: {e}")
+                    logger.warning("Falling back to CPU generator. Planning might need to use CPU tensors.")
+                    # If the device is not CPU, we might need to move tensors to CPU during planning
+                    self.device_mismatch = True
+                self.rng = torch.Generator()
+                self.rng.manual_seed(seed)
+        else:
+            self.rng = None
+            self.device_mismatch = False
 
         # Ensure models are on the correct device and in eval mode
         self.dynamics_model.to(self.device).eval()
@@ -84,15 +98,28 @@ class Planner:
         """
         # Sample random actions for agent 1 and agent 2 independently
         if self.rng is not None:
-            # Use deterministic generator if seed was provided
-            action_sequences = torch.randint(
-                low=0,
-                high=self.num_actions,
-                size=(self.num_samples, self.horizon, 2),
-                dtype=torch.long,
-                device=self.device,
-                generator=self.rng
-            )
+            # Check if we have a device mismatch (generator on CPU but tensors on another device)
+            if hasattr(self, 'device_mismatch') and self.device_mismatch:
+                # Sample on CPU first
+                action_sequences = torch.randint(
+                    low=0,
+                    high=self.num_actions,
+                    size=(self.num_samples, self.horizon, 2),
+                    dtype=torch.long,
+                    generator=self.rng  # This is a CPU generator
+                )
+                # Then move to the target device
+                action_sequences = action_sequences.to(self.device)
+            else:
+                # Use deterministic generator if seed was provided (no device mismatch)
+                action_sequences = torch.randint(
+                    low=0,
+                    high=self.num_actions,
+                    size=(self.num_samples, self.horizon, 2),
+                    dtype=torch.long,
+                    device=self.device,
+                    generator=self.rng
+                )
         else:
             # Use default RNG otherwise
             action_sequences = torch.randint(

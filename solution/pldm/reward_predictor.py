@@ -42,16 +42,18 @@ class GridRewardPredictor(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1)  # Output a single scalar reward
     
-    def forward(self, state, action_indices):
+    def forward(self, state, action_indices, return_embedding=False):
         """
         Forward pass to predict reward.
         
         Args:
             state: Tensor of shape [batch_size, channels, height, width]
             action_indices: Tensor of shape [batch_size, 2] with action indices for both agents
+            return_embedding: If True, returns the internal state embedding instead of the reward prediction
             
         Returns:
-            Tensor of shape [batch_size, 1] representing the predicted reward
+            If return_embedding is False: Tensor of shape [batch_size, 1] representing the predicted reward
+            If return_embedding is True: Tensor of shape [batch_size, state_embed_dim] representing the state embedding
         """
         batch_size = state.shape[0]
         
@@ -70,6 +72,10 @@ class GridRewardPredictor(nn.Module):
             
         # Encode state to fixed dimension
         state_embed = F.relu(self.encoder_proj(x))
+        
+        # If only the embedding is requested, return it here
+        if return_embedding:
+            return state_embed
         
         # Encode actions
         action_embed = self.action_embedding(action_indices)
@@ -124,17 +130,23 @@ class VectorRewardPredictor(nn.Module):
             nn.Linear(hidden_dim, 1)  # Output a single scalar reward
         )
     
-    def forward(self, state_vec, action_indices):
+    def forward(self, state_vec, action_indices, return_embedding=False):
         """
         Forward pass to predict reward.
         
         Args:
             state_vec: Tensor of shape [batch_size, state_dim]
             action_indices: Tensor of shape [batch_size, 2] with action indices for both agents
+            return_embedding: If True, returns the state vector as embedding instead of the reward prediction
             
         Returns:
-            Tensor of shape [batch_size, 1] representing the predicted reward
+            If return_embedding is False: Tensor of shape [batch_size, 1] representing the predicted reward
+            If return_embedding is True: Tensor of shape [batch_size, state_dim] representing the state embedding
         """
+        # If only the state vector is requested as embedding, return it directly
+        if return_embedding:
+            return state_vec
+            
         # Encode actions
         action_embed = self.action_embedding(action_indices)
         

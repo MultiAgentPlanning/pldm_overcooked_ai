@@ -1,0 +1,22 @@
+{
+  "seed": 101,
+  "probing_params": {
+    "batch_size": 64,
+    "lr": 0.001,
+    "epochs": 20,
+    "model_type": "grid",
+    "data_path": "./data/2020_hh_trials.csv",
+    "max_samples": null,
+    "visualize": true,
+    "max_vis_samples": 10,
+    "num_workers": 4,
+    "seed": 101
+  },
+  "targets": [
+    "state",
+    "reward",
+    "agent_pos"
+  ],
+  "probe_dynamics": true,
+  "probe_reward": true
+}

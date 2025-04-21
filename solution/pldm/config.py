@@ -64,6 +64,13 @@ def get_default_config() -> Dict[str, Any]:
         # General settings
         "seed": 42,  # Random seed for reproducibility
         
+        # Workflow control
+        "workflow": {
+            "run_training": True,    # Whether to run the training phase
+            "run_probing": True,     # Whether to run the probing phase
+            "run_planning": True     # Whether to run the planning phase
+        },
+        
         # Data parameters
         "data": {
             "train_data_path": "../data/2020_hh_trials.csv",
@@ -111,6 +118,29 @@ def get_default_config() -> Dict[str, Any]:
             "project": "pldm-overcooked",
             "name": None,           # Run name (if None, wandb generates one)
             "entity": None          # Wandb entity (if None, uses default)
+        },
+        
+        # Probing parameters
+        "probing": {
+            # Probing targets
+            "targets": ["state", "reward", "agent_pos"],
+            "probe_dynamics": True, 
+            "probe_reward": True,
+            
+            # Model parameters
+            "hidden_dims": [128, 64],
+            "activation": "relu",
+            
+            # Training parameters
+            "batch_size": 64,
+            "epochs": 10,
+            "lr": 0.001,
+            "val_ratio": 0.1,
+            "test_ratio": 0.1,
+            
+            # Visualization settings
+            "visualize": True,
+            "max_vis_samples": 10
         }
     }
 
