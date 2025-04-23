@@ -13,10 +13,8 @@
     "seed": 101
   },
   "targets": [
-    "state",
-    "reward",
     "agent_pos"
   ],
   "probe_dynamics": true,
-  "probe_reward": true
+  "probe_reward": false
 }

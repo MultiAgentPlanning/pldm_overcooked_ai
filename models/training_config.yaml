@@ -81,11 +81,9 @@ wandb:
   save_model: true
 probing:
   targets:
-  - state
-  - reward
   - agent_pos
   probe_dynamics: true
-  probe_reward: true
+  probe_reward: false
   hidden_dims:
   - 128
   - 64

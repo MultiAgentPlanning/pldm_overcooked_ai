@@ -9,6 +9,7 @@ import torch
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Optional
+import torch.nn as nn
 
 os.environ['WANDB_IGNORE_GLOBS'] = '*.pem'
 os.environ['CURL_CA_BUNDLE'] = ''
@@ -35,7 +36,36 @@ from solution.probe_pldm import ProberEvaluator, ProbeTarget
 # Get a logger for this module
 logger = logging.getLogger(__name__)
 
-def evaluate_planner(config, model_dir, device, wandb_run=None):
+def print_model_architecture(model, model_name="Model"):
+    """
+    Print detailed architecture information for a PyTorch model.
+    
+    Args:
+        model: PyTorch model to analyze
+        model_name: Name to display for this model
+    """
+    # Title with model name
+    header = f"{'=' * 30} {model_name} ARCHITECTURE {'=' * 30}"
+    print(f"\n{header}")
+    
+    # Print model summary
+    print(model)
+    
+    # Count total parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nTotal parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Print detailed layer information if available
+    print("\nDetailed layer shapes:")
+    for name, param in model.named_parameters():
+        print(f"{name}: {param.shape}")
+    
+    # Print footer
+    print("=" * len(header) + "\n")
+
+def evaluate_planner(config, model_dir, device, wandb_run=None, print_arch=False):
     """
     Evaluate the trained models using planning-based evaluation.
 
@@ -44,6 +74,7 @@ def evaluate_planner(config, model_dir, device, wandb_run=None):
         model_dir: Directory containing the trained models
         device: Device to use for evaluation
         wandb_run: Optional WandB run object for logging results
+        print_arch: Whether to print architecture details
     
     Returns:
         Dictionary containing evaluation metrics
@@ -169,6 +200,23 @@ def evaluate_planner(config, model_dir, device, wandb_run=None):
     )
     logger.info("Planner initialized.")
     
+    # Print planner details if requested
+    if print_arch:
+        # Print planner configuration
+        header = f"{'=' * 30} PLANNER CONFIGURATION {'=' * 30}"
+        print(f"\n{header}")
+        print(f"Planning Horizon: {planning_horizon}")
+        print(f"Planning Samples: {planning_samples}")
+        print(f"Number of Actions: {num_actions}")
+        print(f"Device: {device}")
+        print(f"Seed: {seed}")
+        print(f"Model Type: {model_type}")
+        print("=" * len(header) + "\n")
+        
+        # Print dynamics and reward models used in the planner
+        print_model_architecture(dynamics_model, "PLANNER DYNAMICS MODEL")
+        print_model_architecture(reward_model, "PLANNER REWARD MODEL")
+    
     # Load the dataset for evaluation
     logger.info("Loading dataset for evaluation...")
     try:
@@ -272,7 +320,7 @@ def evaluate_planner(config, model_dir, device, wandb_run=None):
     
     return evaluation_metrics
 
-def run_probing(config, model_dir, device, wandb_run=None):
+def run_probing(config, model_dir, device, wandb_run=None, print_arch=False):
     """
     Run probing analysis on trained models to evaluate their representations.
     
@@ -281,6 +329,7 @@ def run_probing(config, model_dir, device, wandb_run=None):
         model_dir: Directory containing the trained models
         device: Device to use for probing
         wandb_run: Optional WandB run object for logging results
+        print_arch: Whether to print architecture details
     
     Returns:
         Dictionary containing probing metrics
@@ -382,37 +431,35 @@ def run_probing(config, model_dir, device, wandb_run=None):
     
     # Train and evaluate probers
     try:
-        logger.info(f"Training and evaluating probers with {probing_params['epochs']} epochs...")
-        logger.info(f"Probing targets: {targets}")
+        logger.info(f"Training and evaluating probing dynamics_agent_pos with {probing_params['epochs']} epochs...")
         
         # Filter the models to probe based on config
         results = {}
         
-        # Define which models to probe
-        models_to_probe = []
-        if probe_dynamics:
-            models_to_probe.append('dynamics')
-        if probe_reward:
-            models_to_probe.append('reward')
-            
+        # Only probe dynamics model
+        models_to_probe = ['dynamics']
         logger.info(f"Models to probe: {models_to_probe}")
         
-        # For each model and target, train and evaluate a prober
-        for model_type in models_to_probe:
-            for target in targets:
-                # Skip reward model probing reward (redundant)
-                if model_type == 'reward' and target == ProbeTarget.REWARD:
-                    continue
+        # Only train dynamics_agent_pos prober
+        model_type = 'dynamics'
+        target = ProbeTarget.AGENT_POS
+        
+        logger.info(f"Probing {model_type} model for {target}")
+        try:
+            # Set seed for reproducibility
+            set_seeds(seed)
+            
+            # Train and evaluate the prober
+            prober = prober_evaluator.train_prober(target, model_type)
+            
+            # Print prober architecture if requested
+            if print_arch:
+                print_model_architecture(prober, f"PROBER ({model_type}_{target})")
                 
-                logger.info(f"Probing {model_type} model for {target}")
-                try:
-                    # Set seed again before each probing task for extra reproducibility
-                    set_seeds(seed)
-                    prober = prober_evaluator.train_prober(target, model_type)
-                    metrics = prober_evaluator.evaluate_prober(prober, target, model_type)
-                    results[(model_type, target)] = metrics
-                except Exception as e:
-                    logger.error(f"Error probing {model_type} for {target}: {e}")
+            metrics = prober_evaluator.evaluate_prober(prober, target, model_type)
+            results[(model_type, target)] = metrics
+        except Exception as e:
+            logger.error(f"Error probing {model_type} for {target}: {e}")
         
         # Aggregate results
         if results:
@@ -460,6 +507,8 @@ def main():
                         help="Test with a small subset of data (shortcut for testing configuration)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility")
+    parser.add_argument("--print_model_arch", action="store_true", default=True,
+                        help="Print detailed model architectures")
 
     # Workflow control arguments (to override config)
     parser.add_argument("--run_training", action="store_true", dest="run_training",
@@ -699,6 +748,12 @@ def main():
                 disable_artifacts=True  # Disable WandB artifacts to avoid storage errors
             )
             logger.info("PLDMTrainer initialized.")
+            
+            # Print model architectures if requested
+            if args.print_model_arch and trainer.dynamics_model is not None and trainer.reward_model is not None:
+                print_model_architecture(trainer.dynamics_model, "DYNAMICS MODEL")
+                print_model_architecture(trainer.reward_model, "REWARD MODEL")
+                
         except ValueError as ve:
              logger.error(f"Trainer initialization failed: {ve}")
              if wandb_run: wandb.finish(exit_code=1)
@@ -739,7 +794,8 @@ def main():
                 config=config,
                 model_dir=config["training"]["output_dir"],
                 device=device,
-                wandb_run=wandb_run
+                wandb_run=wandb_run,
+                print_arch=args.print_model_arch
             )
             
             # Log a summary of the probing metrics
@@ -766,7 +822,8 @@ def main():
                 config=config,
                 model_dir=config["training"]["output_dir"],
                 device=device,
-                wandb_run=wandb_run
+                wandb_run=wandb_run,
+                print_arch=args.print_model_arch
             )
             
             # Log a summary of the evaluation metrics
