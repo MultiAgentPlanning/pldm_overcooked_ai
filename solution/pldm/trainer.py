@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -24,6 +25,8 @@ from .state_encoder import GridStateEncoder, VectorStateEncoder, StateEncoderNet
 from .dynamics_predictor import GridDynamicsPredictor, VectorDynamicsPredictor, SharedEncoderDynamicsPredictor
 from .reward_predictor import GridRewardPredictor, VectorRewardPredictor, SharedEncoderRewardPredictor
 from .data_processor import get_overcooked_dataloaders
+from .objectives import get_loss_function, MSELoss, VICRegLoss
+from .predictors import TransformerPredictor
 
 # Get a logger for this module
 logger = logging.getLogger(__name__)
@@ -57,7 +60,9 @@ class PLDMTrainer:
         state_encoder=None,
         gamma=0.99,
         wandb_run=None, # Pass wandb run object (optional)
-        disable_artifacts=True # Disable WandB artifacts by default
+        disable_artifacts=True, # Disable WandB artifacts by default
+        config=None,  # Added configuration parameter
+        teacher_forcing_ratio=0.5  # Added teacher forcing ratio
     ):
         # Setup output directory
         self.output_dir = Path(output_dir)
@@ -76,6 +81,8 @@ class PLDMTrainer:
         self.test_ratio = float(test_ratio) if not isinstance(test_ratio, float) else test_ratio
         self.seed = seed
         self.disable_artifacts = disable_artifacts
+        self.config = config or {}  # Store config or use empty dict
+        self.teacher_forcing_ratio = teacher_forcing_ratio
         
         # Handle grid dimensions that might be None or strings
         if grid_height is not None and not isinstance(grid_height, int):
@@ -134,8 +141,6 @@ class PLDMTrainer:
         self.reward_model = None
         self.dynamics_optimizer = None
         self.reward_optimizer = None
-        self.dynamics_criterion = nn.MSELoss()
-        self.reward_criterion = nn.MSELoss()
         
         # Load and prepare data if path is provided
         if data_path:
@@ -174,7 +179,7 @@ class PLDMTrainer:
         # Get a sample batch to determine dimensions
         try:
             sample_batch = next(iter(self.train_loader))
-            state, action, _, _ = sample_batch
+            state, action, next_state, reward = sample_batch
             logger.info("Got sample batch for model initialization.")
         except StopIteration:
              logger.error("Data loader is empty. Cannot initialize models.")
@@ -182,6 +187,17 @@ class PLDMTrainer:
         except Exception as e:
             logger.error(f"Error getting sample batch: {e}")
             raise
+        
+        # Get model configuration
+        model_config = self.config.get("model", {})
+        dynamics_predictor_config = model_config.get("dynamics_predictor", {})
+        reward_predictor_config = model_config.get("reward_predictor", {})
+        
+        # Get predictor types
+        dynamics_predictor_type = dynamics_predictor_config.get("predictor_type", self.model_type)
+        reward_predictor_type = reward_predictor_config.get("predictor_type", self.model_type)
+        
+        logger.info(f"Initializing models - Dynamics: {dynamics_predictor_type}, Reward: {reward_predictor_type}")
         
         # Get state shape
         if self.model_type == "grid":
@@ -195,49 +211,185 @@ class PLDMTrainer:
                 
             logger.info(f"Initializing grid models with dimensions: channels={num_channels}, height={self.grid_height}, width={self.grid_width}")
             
-            # Initialize grid-based models
-            self.dynamics_model = GridDynamicsPredictor(
-                state_embed_dim=self.state_embed_dim,
-                action_embed_dim=self.action_embed_dim,
-                num_actions=self.num_actions,
-                hidden_dim=self.dynamics_hidden_dim,
-                num_channels=num_channels,
-                grid_height=self.grid_height,
-                grid_width=self.grid_width
-            ).to(self.device)
+            # Initialize dynamics model based on predictor type
+            if dynamics_predictor_type.lower() == "transformer":
+                # For transformer predictor with grid state
+                state_embed_dim = dynamics_predictor_config.get("hidden_size", self.state_embed_dim)
+                num_layers = dynamics_predictor_config.get("num_layers", 2)
+                num_heads = dynamics_predictor_config.get("nhead", 4)
+                dropout = dynamics_predictor_config.get("dropout", 0.1)
+                
+                # Flattened grid dimensions for transformer input
+                input_dim = num_channels * self.grid_height * self.grid_width
+                output_dim = num_channels * self.grid_height * self.grid_width
+                
+                self.dynamics_model = TransformerPredictor(
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    num_actions=self.num_actions,
+                    action_embed_dim=self.action_embed_dim,
+                    hidden_size=state_embed_dim,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    is_reward=False,
+                    teacher_forcing_ratio=self.teacher_forcing_ratio
+                ).to(self.device)
+                
+                logger.info(f"Initialized TransformerPredictor for dynamics with teacher_forcing_ratio={self.teacher_forcing_ratio}")
+            else:
+                # Default grid dynamics predictor
+                self.dynamics_model = GridDynamicsPredictor(
+                    state_embed_dim=self.state_embed_dim,
+                    action_embed_dim=self.action_embed_dim,
+                    num_actions=self.num_actions,
+                    hidden_dim=self.dynamics_hidden_dim,
+                    num_channels=num_channels,
+                    grid_height=self.grid_height,
+                    grid_width=self.grid_width
+                ).to(self.device)
             
-            self.reward_model = GridRewardPredictor(
-                state_embed_dim=self.state_embed_dim,
-                action_embed_dim=self.action_embed_dim,
-                num_actions=self.num_actions,
-                hidden_dim=self.reward_hidden_dim,
-                num_channels=num_channels,
-                grid_height=self.grid_height,
-                grid_width=self.grid_width
-            ).to(self.device)
+            # Initialize reward model based on predictor type
+            if reward_predictor_type.lower() == "transformer":
+                # For transformer predictor with grid state
+                state_embed_dim = reward_predictor_config.get("hidden_size", self.state_embed_dim)
+                num_layers = reward_predictor_config.get("num_layers", 2)
+                num_heads = reward_predictor_config.get("nhead", 4)
+                dropout = reward_predictor_config.get("dropout", 0.1)
+                
+                # Flattened grid dimensions for transformer input
+                input_dim = num_channels * self.grid_height * self.grid_width
+                
+                self.reward_model = TransformerPredictor(
+                    input_dim=input_dim,
+                    output_dim=1,  # Reward is a scalar
+                    num_actions=self.num_actions,
+                    action_embed_dim=self.action_embed_dim,
+                    hidden_size=state_embed_dim,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    is_reward=True,
+                    teacher_forcing_ratio=self.teacher_forcing_ratio
+                ).to(self.device)
+                
+                logger.info(f"Initialized TransformerPredictor for reward with teacher_forcing_ratio={self.teacher_forcing_ratio}")
+            else:
+                # Default grid reward predictor
+                self.reward_model = GridRewardPredictor(
+                    state_embed_dim=self.state_embed_dim,
+                    action_embed_dim=self.action_embed_dim,
+                    num_actions=self.num_actions,
+                    hidden_dim=self.reward_hidden_dim,
+                    num_channels=num_channels,
+                    grid_height=self.grid_height,
+                    grid_width=self.grid_width
+                ).to(self.device)
+            
+            # Determine input dimensions for VICReg loss if used
+            dynamics_input_dim = num_channels * grid_height * grid_width
+            reward_input_dim = 1  # Reward is a scalar
+            
         else:  # model_type == "vector"
             batch_size, state_dim = state.shape
             logger.info(f"Initializing vector models with state_dim={state_dim}")
             
-            # Initialize vector-based models
-            self.dynamics_model = VectorDynamicsPredictor(
-                state_dim=state_dim,
-                action_embed_dim=self.action_embed_dim,
-                num_actions=self.num_actions,
-                hidden_dim=self.dynamics_hidden_dim
-            ).to(self.device)
+            # Initialize dynamics model based on predictor type
+            if dynamics_predictor_type.lower() == "transformer":
+                # For transformer predictor with vector state
+                state_embed_dim = dynamics_predictor_config.get("hidden_size", self.state_embed_dim)
+                num_layers = dynamics_predictor_config.get("num_layers", 2)
+                num_heads = dynamics_predictor_config.get("nhead", 4)
+                dropout = dynamics_predictor_config.get("dropout", 0.1)
+                
+                self.dynamics_model = TransformerPredictor(
+                    input_dim=state_dim,
+                    output_dim=state_dim,
+                    num_actions=self.num_actions,
+                    action_embed_dim=self.action_embed_dim,
+                    hidden_size=state_embed_dim,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    is_reward=False,
+                    teacher_forcing_ratio=self.teacher_forcing_ratio
+                ).to(self.device)
+                
+                logger.info(f"Initialized TransformerPredictor for dynamics with teacher_forcing_ratio={self.teacher_forcing_ratio}")
+            else:
+                # Default vector dynamics predictor
+                self.dynamics_model = VectorDynamicsPredictor(
+                    state_dim=state_dim,
+                    action_embed_dim=self.action_embed_dim,
+                    num_actions=self.num_actions,
+                    hidden_dim=self.dynamics_hidden_dim
+                ).to(self.device)
             
-            self.reward_model = VectorRewardPredictor(
-                state_dim=state_dim,
-                action_embed_dim=self.action_embed_dim,
-                num_actions=self.num_actions,
-                hidden_dim=self.reward_hidden_dim
-            ).to(self.device)
+            # Initialize reward model based on predictor type
+            if reward_predictor_type.lower() == "transformer":
+                # For transformer predictor with vector state
+                state_embed_dim = reward_predictor_config.get("hidden_size", self.state_embed_dim)
+                num_layers = reward_predictor_config.get("num_layers", 2)
+                num_heads = reward_predictor_config.get("nhead", 4)
+                dropout = reward_predictor_config.get("dropout", 0.1)
+                
+                self.reward_model = TransformerPredictor(
+                    input_dim=state_dim,
+                    output_dim=1,  # Reward is a scalar
+                    num_actions=self.num_actions,
+                    action_embed_dim=self.action_embed_dim,
+                    hidden_size=state_embed_dim,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    is_reward=True,
+                    teacher_forcing_ratio=self.teacher_forcing_ratio
+                ).to(self.device)
+                
+                logger.info(f"Initialized TransformerPredictor for reward with teacher_forcing_ratio={self.teacher_forcing_ratio}")
+            else:
+                # Default vector reward predictor
+                self.reward_model = VectorRewardPredictor(
+                    state_dim=state_dim,
+                    action_embed_dim=self.action_embed_dim,
+                    num_actions=self.num_actions,
+                    hidden_dim=self.reward_hidden_dim
+                ).to(self.device)
+            
+            # Determine input dimensions for VICReg loss if used
+            dynamics_input_dim = state_dim
+            reward_input_dim = 1  # Reward is a scalar
         
         # Initialize optimizers
         self.dynamics_optimizer = optim.Adam(self.dynamics_model.parameters(), lr=self.lr)
         self.reward_optimizer = optim.Adam(self.reward_model.parameters(), lr=self.lr)
         logger.info("Optimizers initialized.")
+        
+        # Initialize loss functions based on configuration
+        loss_config = self.config.get("loss", {})
+        dynamics_loss_type = loss_config.get("dynamics_loss", "mse")
+        reward_loss_type = loss_config.get("reward_loss", "mse")
+        vicreg_config = loss_config.get("vicreg", {})
+        
+        logger.info(f"Initializing loss functions - Dynamics: {dynamics_loss_type}, Reward: {reward_loss_type}")
+        
+        # Initialize dynamics loss
+        self.dynamics_criterion = get_loss_function(
+            loss_type=dynamics_loss_type,
+            model_type="dynamics",
+            input_dim=dynamics_input_dim,
+            config=vicreg_config if dynamics_loss_type.lower() == "vicreg" else None,
+            name_prefix="train"
+        )
+        
+        # Initialize reward loss
+        self.reward_criterion = get_loss_function(
+            loss_type=reward_loss_type,
+            model_type="reward",
+            input_dim=reward_input_dim,
+            config=vicreg_config if reward_loss_type.lower() == "vicreg" else None,
+            name_prefix="train"
+        )
         
         # Print the size of the model to verify
         total_dynamics_params = sum(p.numel() for p in self.dynamics_model.parameters() if p.requires_grad)
@@ -467,7 +619,14 @@ class PLDMTrainer:
             
             if is_dynamics:
                 target = next_state.to(self.device)
-                output = model(state, action)
+                
+                # Check if model is a transformer type that supports teacher forcing
+                if isinstance(model, TransformerPredictor) and hasattr(model, 'teacher_forcing_ratio'):
+                    # Use teacher forcing during training
+                    output = model(state, action, target_state=target)
+                else:
+                    # Regular forward pass for other model types
+                    output = model(state, action)
                 
                 # Sometimes outputs can have different shapes due to padding
                 if output.shape != target.shape:
@@ -491,9 +650,15 @@ class PLDMTrainer:
                          logger.error("Could not reshape reward target to match output. Skipping loss calculation for this batch.")
                          continue # Skip batch if shapes irreconcilable
             
-            # Calculate loss
+            # Calculate loss using the criterion
             try:
-                loss = criterion(output, target)
+                # Use the new loss function interface
+                loss_info = criterion(output, target)
+                loss = loss_info.total_loss
+                
+                # Log detailed loss components if available (for VICReg)
+                if hasattr(loss_info, 'build_log_dict') and self.use_wandb:
+                    wandb.log(loss_info.build_log_dict())
             except Exception as loss_err:
                 logger.error(f"Error computing loss for batch {batch_idx}: {loss_err}. Output: {output.shape}, Target: {target.shape}")
                 continue # Skip batch if loss calculation fails
@@ -567,7 +732,10 @@ class PLDMTrainer:
                              continue
                 
                 try:
-                    loss = criterion(output, target)
+                    # Use the new loss function interface
+                    loss_info = criterion(output, target)
+                    loss = loss_info.total_loss
+                    
                     total_loss += loss.item()
                     total_batches += 1
                     data_iterator.set_postfix(loss=f"{loss.item():.6f}")

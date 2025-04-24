@@ -2,6 +2,7 @@ import os
 import yaml
 import json
 from pathlib import Path
+import copy
 from typing import Dict, Any, Optional
 
 
@@ -55,92 +56,99 @@ def save_config(config: Dict[str, Any], config_path: str) -> None:
 
 def get_default_config() -> Dict[str, Any]:
     """
-    Get default configuration parameters for PLDM models.
+    Get the default configuration.
     
     Returns:
         Dictionary containing default configuration parameters
     """
     return {
-        # General settings
         "seed": 42,  # Random seed for reproducibility
         
-        # Workflow control
+        # Workflow options
         "workflow": {
-            "run_training": True,    # Whether to run the training phase
-            "run_probing": True,     # Whether to run the probing phase
-            "run_planning": True     # Whether to run the planning phase
+            "run_training": True,
+            "run_probing": True,
+            "run_planning": True
         },
         
         # Data parameters
         "data": {
-            "train_data_path": "../data/2020_hh_trials.csv",
-            "val_data_path": None,  # If None, will use a split of train data
-            "val_ratio": 0.1,       # Ratio of train data to use for validation if val_data_path is None
-            "test_ratio": 0.1,      # Ratio of train data to use for testing
-            "max_samples": None,    # Maximum number of samples to use (for testing)
+            "train_data_path": "./data/train.csv",
+            "val_data_path": None,  # If None, val_ratio will be used
+            "test_data_path": None,  # If None, test_ratio will be used
+            "val_ratio": 0.1,  # Ratio of data for validation
+            "test_ratio": 0.1,  # Ratio of data for testing
+            "max_samples": None,  # Maximum number of samples to use (None for all)
+            "grid_size": 5,  # Size of grid for grid-based representation
         },
         
         # Model parameters
         "model": {
-            "type": "grid",         # 'grid' or 'vector'
-            "state_embed_dim": 128,
-            "action_embed_dim": 4,
-            "num_actions": 6,
-            "dynamics_hidden_dim": 256,
-            "reward_hidden_dim": 64,
-            "grid_height": 5,
-            "grid_width": 13,
+            "type": "grid",  # Model type: 'grid' or 'vector'
+            "state_embed_dim": 128,  # Dimension of state embedding
+            "action_embed_dim": 4,  # Dimension of action embedding
+            "num_actions": 6,  # Number of possible actions
+            "dynamics_hidden_dim": 128,  # Hidden dimension for dynamics model
+            "reward_hidden_dim": 64,  # Hidden dimension for reward model
+            "grid_height": None,  # Grid height (None for auto-detect)
+            "grid_width": None  # Grid width (None for auto-detect)
+        },
+        
+        # Loss function parameters
+        "loss": {
+            "dynamics_loss": "mse",  # Loss type for dynamics: 'mse' or 'vicreg'
+            "reward_loss": "mse",    # Loss type for reward: 'mse' or 'vicreg'
+            
+            # VICReg specific parameters (if using VICReg)
+            "vicreg": {
+                "projector_layers": [2048, 2048, 2048],  # MLP projector dimensions
+                "output_dim": 256,                      # Projector output dimension
+                "sim_coeff": 25.0,                      # Coefficient for similarity loss
+                "std_coeff": 25.0,                      # Coefficient for std loss
+                "cov_coeff": 1.0,                       # Coefficient for covariance loss
+                "std_margin": 1.0                       # Margin for std loss
+            }
         },
         
         # Training parameters
         "training": {
-            "output_dir": "./models",
-            "batch_size": 64,
-            "learning_rate": 1e-4,
-            "dynamics_epochs": 10,
-            "reward_epochs": 5,
-            "log_interval": 10,
-            "num_workers": 4,
-            "device": "auto",       # 'auto', 'cuda', or 'cpu'
+            "output_dir": "models/pldm",  # Directory to save models
+            "batch_size": 32,  # Batch size
+            "dynamics_epochs": 10,  # Number of epochs for dynamics model
+            "reward_epochs": 5,  # Number of epochs for reward model
+            "learning_rate": 0.001,  # Learning rate
+            "log_interval": 10,  # Interval for logging
+            "num_workers": 4,  # Number of workers for data loading
+            "device": "auto"  # Device for training ('cuda', 'cpu', or 'auto')
         },
         
         # Testing parameters
         "testing": {
-            "test_data_path": None,  # If None, will use training data
-            "num_samples": 100,      # Number of samples to evaluate
-            "planning_horizon": 100, # Default planning horizon for evaluation
-            "planning_samples": 100  # Default number of samples for planner evaluation
+            "num_samples": 100,  # Number of samples for evaluation
+            "planning_horizon": 5,  # Planning horizon
+            "planning_samples": 100  # Number of samples for planning
         },
-
+        
         # WandB parameters
         "wandb": {
-            "use_wandb": False,      # Whether to use WandB logging
-            "project": "pldm-overcooked",
-            "name": None,           # Run name (if None, wandb generates one)
-            "entity": None          # Wandb entity (if None, uses default)
+            "use_wandb": False,  # Whether to use WandB
+            "project": "pldm-overcooked",  # Project name
+            "name": None,  # Run name (None for auto-generated)
+            "entity": None  # WandB entity (None for default)
         },
         
         # Probing parameters
         "probing": {
-            # Probing targets
-            "targets": ["state", "reward", "agent_pos"],
-            "probe_dynamics": True, 
-            "probe_reward": True,
-            
-            # Model parameters
-            "hidden_dims": [128, 64],
-            "activation": "relu",
-            
-            # Training parameters
-            "batch_size": 64,
-            "epochs": 10,
-            "lr": 0.001,
-            "val_ratio": 0.1,
-            "test_ratio": 0.1,
-            
-            # Visualization settings
-            "visualize": True,
-            "max_vis_samples": 10
+            "targets": ["agent_pos", "reward"],  # Probing targets
+            "probe_dynamics": True,  # Whether to probe dynamics model
+            "probe_reward": True,  # Whether to probe reward model
+            "batch_size": 64,  # Batch size for probing
+            "epochs": 10,  # Number of epochs for probing
+            "lr": 0.001,  # Learning rate for probing
+            "val_ratio": 0.1,  # Ratio of data for validation
+            "test_ratio": 0.1,  # Ratio of data for testing
+            "visualize": True,  # Whether to visualize results
+            "max_vis_samples": 10  # Maximum number of samples to visualize
         }
     }
 

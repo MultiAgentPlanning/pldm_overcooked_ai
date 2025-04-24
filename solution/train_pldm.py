@@ -745,7 +745,8 @@ def main():
                 seed=seed,  # Pass the seed for reproducible data splitting
                 # Pass wandb_run object to trainer if needed, or check wandb.run directly
                 wandb_run=wandb_run,
-                disable_artifacts=True  # Disable WandB artifacts to avoid storage errors
+                disable_artifacts=True,  # Disable WandB artifacts to avoid storage errors
+                config=config  # Pass the entire config to the trainer
             )
             logger.info("PLDMTrainer initialized.")
             
