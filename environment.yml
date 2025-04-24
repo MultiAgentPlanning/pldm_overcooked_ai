@@ -1,0 +1,7 @@
+name: overcooked_env
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.10
+prefix: /ext3/miniconda3/envs/overcooked_env
