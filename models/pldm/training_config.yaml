@@ -1,0 +1,136 @@
+seed: 101
+workflow:
+  run_training: true
+  run_probing: true
+  run_planning: true
+data:
+  train_data_path: /home/km6748/pldm_overcooked_ai/data/raw/2020_hh_trials.csv
+  val_data_path: null
+  test_data_path: null
+  val_ratio: 0.1
+  test_ratio: 0.1
+  max_samples: null
+  grid_size: 5
+model:
+  type: grid
+  state_embed_dim: 128
+  action_embed_dim: 4
+  num_actions: 6
+  dynamics_hidden_dim: 128
+  reward_hidden_dim: 64
+  grid_height: null
+  grid_width: null
+  encoder_type: cnn
+  grid_dims:
+    H: 5
+    W: 5
+  in_channels: 26
+  num_objects: 17
+  hidden_channels:
+  - 16
+  - 32
+  - 64
+  fc_dims:
+  - 256
+  - 128
+  dynamics_predictor:
+    predictor_type: grid
+    hidden_size: 128
+    num_layers: 3
+    dropout: 0.0
+    activation: relu
+    nhead: 4
+    num_encoder_layers: 2
+    dim_feedforward: 512
+    bidirectional: false
+  reward_predictor:
+    predictor_type: grid
+    hidden_size: 64
+    num_layers: 3
+    dropout: 0.0
+    activation: relu
+    nhead: 4
+    num_encoder_layers: 2
+    dim_feedforward: 512
+    bidirectional: false
+  teacher_forcing_ratio: 0.5
+  reward_hidden_dims:
+  - 128
+  - 64
+  - 32
+  reward_activation: relu
+  dynamics_hidden_dims:
+  - 128
+  - 64
+  - 32
+  dynamics_activation: relu
+  activation: relu
+  use_layer_norm: false
+  device: cuda
+loss:
+  dynamics_loss: mse
+  reward_loss: mse
+  vicreg:
+    projector_layers:
+    - 2048
+    - 2048
+    - 2048
+    output_dim: 256
+    sim_coeff: 25.0
+    std_coeff: 25.0
+    cov_coeff: 1.0
+    std_margin: 1.0
+    projector_type: identity
+    sim_coeff_t: 10.0
+    std_coeff_t: 5.0
+    cov_coeff_t: 0.5
+    std_margin_t: 1.0
+    adjust_cov: true
+training:
+  output_dir: models/pldm
+  batch_size: 128
+  dynamics_epochs: 10
+  reward_epochs: 5
+  learning_rate: 0.001
+  log_interval: 10
+  num_workers: 4
+  device: auto
+  optimizer: adam
+  weight_decay: 1.0e-05
+  scheduler: plateau
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+  scheduler_min_lr: 1.0e-06
+  max_norm: 1.0
+  use_layer_norm: false
+  seed: 42
+testing:
+  num_samples: 100
+  planning_horizon: 5
+  planning_samples: 100
+  batch_size: 128
+  use_val_data: false
+  use_test_data: true
+wandb:
+  use_wandb: true
+  project: pldm-overcooked
+  name: base
+  entity: harshsutariya1179
+  watch_model: true
+  save_model: true
+probing:
+  targets:
+  - agent_pos
+  probe_dynamics: true
+  probe_reward: false
+  batch_size: 64
+  epochs: 20
+  lr: 0.001
+  val_ratio: 0.1
+  test_ratio: 0.1
+  visualize: true
+  max_vis_samples: 10
+  hidden_dims:
+  - 128
+  - 64
+  activation: relu
