@@ -1001,89 +1001,89 @@ class PLDMTrainer:
     def load_model(self, model_name, model_path=None, cnn_encoder_path=None):
         """
         Load model from disk. Loads both predictor and CNN encoder if paths provided.
-        NOTE: Loading is currently disabled as requested.
         
         Args:
             model_name: Name of the model to load ('dynamics' or 'reward').
             model_path: Path to the predictor model file (.pt). Defaults to standard path in output_dir.
             cnn_encoder_path: Path to the CNN encoder file (.pt). Defaults to standard path. Required if model uses CNN.
         """
-        logger.info(f"Skipping load_model for '{model_name}' as requested. Models will be trained from scratch.")
-        return # Exit the function immediately, preventing any loading
+        logger.info(f"Loading model '{model_name}' from output directory: {self.output_dir}")
+        # logger.info(f"Skipping load_model for '{model_name}' as requested. Models will be trained from scratch.")
+        # return # Exit the function immediately, preventing any loading
         
-        # --- Original loading code below (commented out or removed) ---
-        # # Determine default paths if not provided
-        # if model_path is None:
-        #     model_path = os.path.join(self.output_dir, f"{model_name}_model.pt")
-        # if cnn_encoder_path is None and model_name == 'dynamics': # Only default load CNN for dynamics
-        #      cnn_encoder_path = os.path.join(self.output_dir, "cnn_encoder.pt")
-        # 
-        # # --- Load Predictor Model ---
-        # if os.path.exists(model_path):
-        #     try:
-        #         checkpoint = torch.load(model_path, map_location=self.device)
-        #         
-        #         # Handle different checkpoint formats
-        #         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        #             model_state_dict = checkpoint['model_state_dict']
-        #             optimizer_state_dict = checkpoint.get('optimizer_state_dict')
-        #         else:
-        #             # Assume the checkpoint is the state_dict itself (older format)
-        #             model_state_dict = checkpoint
-        #             optimizer_state_dict = None
-        #             logger.warning(f"Loaded checkpoint for {model_name} seems to be only a state_dict. Optimizer state not loaded.")
-        #         
-        #         if model_name == 'dynamics' and self.dynamics_model:
-        #             self.dynamics_model.load_state_dict(model_state_dict)
-        #             # Load optimizer state if available and needed
-        #             if optimizer_state_dict and self.dynamics_optimizer:
-        #                  try:
-        #                      self.dynamics_optimizer.load_state_dict(optimizer_state_dict)
-        #                  except Exception as opt_e:
-        #                       logger.warning(f"Could not load dynamics optimizer state from checkpoint: {opt_e}")
-        #             logger.info(f"Loaded {model_name} predictor model from {model_path}")
-        #         elif model_name == 'reward' and self.reward_model:
-        #             self.reward_model.load_state_dict(model_state_dict)
-        #             if optimizer_state_dict and self.reward_optimizer:
-        #                 try:
-        #                      self.reward_optimizer.load_state_dict(optimizer_state_dict)
-        #                 except Exception as opt_e:
-        #                       logger.warning(f"Could not load reward optimizer state from checkpoint: {opt_e}")
-        #             logger.info(f"Loaded {model_name} predictor model from {model_path}")
-        #         else:
-        #             logger.warning(f"{model_name.capitalize()} model not initialized, cannot load state dict from {model_path}")
-        # 
-        #     except FileNotFoundError:
-        #         logger.error(f"Predictor model file not found at {model_path}. Cannot load {model_name} model.")
-        #     except Exception as e:
-        #         logger.error(f"Error loading {model_name} predictor model from {model_path}: {e}", exc_info=True)
-        # else:
-        #      logger.warning(f"Predictor model file {model_path} does not exist. Model not loaded.")
-        # 
-        # 
-        # # --- Load CNN Encoder ---
-        # # Only load if cnn_encoder exists on the trainer AND path is valid AND it's for dynamics
-        # if model_name == 'dynamics' and hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None:
-        #     if cnn_encoder_path and os.path.exists(cnn_encoder_path):
-        #         try:
-        #             cnn_checkpoint = torch.load(cnn_encoder_path, map_location=self.device)
-        #             
-        #             # Handle different checkpoint formats
-        #             if isinstance(cnn_checkpoint, dict) and 'model_state_dict' in cnn_checkpoint:
-        #                 cnn_model_state_dict = cnn_checkpoint['model_state_dict']
-        #             else:
-        #                 cnn_model_state_dict = cnn_checkpoint
-        #                 logger.warning("Loaded CNN checkpoint seems to be only a state_dict.")
-        #                 
-        #             self.cnn_encoder.load_state_dict(cnn_model_state_dict)
-        #             logger.info(f"Loaded CNN encoder from {cnn_encoder_path}")
-        #             # Note: CNN optimizer state is part of dynamics_optimizer state, loaded above.
-        #         except FileNotFoundError:
-        #              logger.error(f"CNN encoder file not found at {cnn_encoder_path}. Cannot load.")
-        #         except Exception as e:
-        #             logger.error(f"Error loading CNN encoder model from {cnn_encoder_path}: {e}", exc_info=True)
-        #     else:
-        #          logger.warning(f"CNN encoder path {cnn_encoder_path} not found or not specified. CNN encoder not loaded.")
+        # --- Original loading code below ---
+        # Determine default paths if not provided
+        if model_path is None:
+            model_path = os.path.join(self.output_dir, f"{model_name}_model.pt")
+        if cnn_encoder_path is None and model_name == 'dynamics': # Only default load CNN for dynamics
+             cnn_encoder_path = os.path.join(self.output_dir, "cnn_encoder.pt")
+        
+        # --- Load Predictor Model ---
+        if os.path.exists(model_path):
+            try:
+                checkpoint = torch.load(model_path, map_location=self.device)
+                
+                # Handle different checkpoint formats
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    model_state_dict = checkpoint['model_state_dict']
+                    optimizer_state_dict = checkpoint.get('optimizer_state_dict')
+                else:
+                    # Assume the checkpoint is the state_dict itself (older format)
+                    model_state_dict = checkpoint
+                    optimizer_state_dict = None
+                    logger.warning(f"Loaded checkpoint for {model_name} seems to be only a state_dict. Optimizer state not loaded.")
+                
+                if model_name == 'dynamics' and self.dynamics_model:
+                    self.dynamics_model.load_state_dict(model_state_dict)
+                    # Load optimizer state if available and needed
+                    if optimizer_state_dict and self.dynamics_optimizer:
+                         try:
+                             self.dynamics_optimizer.load_state_dict(optimizer_state_dict)
+                         except Exception as opt_e:
+                              logger.warning(f"Could not load dynamics optimizer state from checkpoint: {opt_e}")
+                    logger.info(f"Loaded {model_name} predictor model from {model_path}")
+                elif model_name == 'reward' and self.reward_model:
+                    self.reward_model.load_state_dict(model_state_dict)
+                    if optimizer_state_dict and self.reward_optimizer:
+                        try:
+                             self.reward_optimizer.load_state_dict(optimizer_state_dict)
+                        except Exception as opt_e:
+                              logger.warning(f"Could not load reward optimizer state from checkpoint: {opt_e}")
+                    logger.info(f"Loaded {model_name} predictor model from {model_path}")
+                else:
+                    logger.warning(f"{model_name.capitalize()} model not initialized, cannot load state dict from {model_path}")
+
+            except FileNotFoundError:
+                logger.error(f"Predictor model file not found at {model_path}. Cannot load {model_name} model.")
+            except Exception as e:
+                logger.error(f"Error loading {model_name} predictor model from {model_path}: {e}", exc_info=True)
+        else:
+             logger.warning(f"Predictor model file {model_path} does not exist. Model not loaded.")
+
+
+        # --- Load CNN Encoder ---
+        # Only load if cnn_encoder exists on the trainer AND path is valid AND it's for dynamics
+        if model_name == 'dynamics' and hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None:
+            if cnn_encoder_path and os.path.exists(cnn_encoder_path):
+                try:
+                    cnn_checkpoint = torch.load(cnn_encoder_path, map_location=self.device)
+                    
+                    # Handle different checkpoint formats
+                    if isinstance(cnn_checkpoint, dict) and 'model_state_dict' in cnn_checkpoint:
+                        cnn_model_state_dict = cnn_checkpoint['model_state_dict']
+                    else:
+                        cnn_model_state_dict = cnn_checkpoint
+                        logger.warning("Loaded CNN checkpoint seems to be only a state_dict.")
+                        
+                    self.cnn_encoder.load_state_dict(cnn_model_state_dict)
+                    logger.info(f"Loaded CNN encoder from {cnn_encoder_path}")
+                    # Note: CNN optimizer state is part of dynamics_optimizer state, loaded above.
+                except FileNotFoundError:
+                     logger.error(f"CNN encoder file not found at {cnn_encoder_path}. Cannot load.")
+                except Exception as e:
+                    logger.error(f"Error loading CNN encoder model from {cnn_encoder_path}: {e}", exc_info=True)
+            else:
+                 logger.warning(f"CNN encoder path {cnn_encoder_path} not found or not specified. CNN encoder not loaded.")
 
 
 # Example usage (within another script like train_pldm.py)
