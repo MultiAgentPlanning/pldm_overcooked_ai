@@ -62,7 +62,7 @@ model:
     bidirectional: false  # Whether to use bidirectional LSTM
   
   # Teacher forcing parameters
-  teacher_forcing_ratio: 0.5  # Probability of using teacher forcing during training (0.0 to 1.0) #only for transformer predictor
+  teacher_forcing_ratio: 0  # Probability of using teacher forcing during training (0.0 to 1.0) #only for transformer predictor
   
   # reward predictor params
   reward_hidden_dims: [128, 64, 32]
@@ -99,7 +99,7 @@ loss:
 # Training parameters
 training:
   batch_size: 128
-  dynamics_epochs: 1
+  dynamics_epochs: 100
   reward_epochs: 1
   learning_rate: 0.001
   optimizer: "adam"
@@ -159,8 +159,8 @@ probing:
   
   # Training parameters
   batch_size: 64
-  epochs: 100             # Number of epochs for training probers
-  lr: 0.0001             # Learning rate
+  epochs: 30             # Number of epochs for training probers
+  lr: 0.001             # Learning rate
   
   # Visualization settings
   visualize: false
