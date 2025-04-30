@@ -542,36 +542,23 @@ class ProbingEvaluator:
         
         # Calculate metrics
         mean_loss = all_losses.mean().item()
-        rmse = torch.sqrt(all_losses.mean()).item()
         
         # Calculate per-element losses to understand which parts are predicted well
         per_element_loss = all_losses.mean(dim=0)
         
-        # R²-score calculation
-        target_var = torch.var(all_targets, dim=0, unbiased=False)
-        unexplained_var = torch.var(all_targets - all_predictions, dim=0, unbiased=False)
-        r2_score = 1 - (unexplained_var / target_var)
-        mean_r2 = r2_score.mean().item()
-        
         # Compile metrics
         metrics = {
             'mean_loss': mean_loss,
-            'rmse': rmse,
-            'r2_score': mean_r2,
             'per_element_loss': per_element_loss.tolist()
         }
         
         logger.info(f"Prober evaluation results for {model_type}_{repr_type}_{channel_name}:")
         logger.info(f"  Mean Loss: {mean_loss:.6f}")
-        logger.info(f"  RMSE: {rmse:.6f}")
-        logger.info(f"  R² Score: {mean_r2:.6f}")
         
         # Log to WandB
         if self.use_wandb:
             self.wandb_run.log({
-                f"prober_{model_type}_{repr_type}_{channel_name}/test_loss": mean_loss,
-                f"prober_{model_type}_{repr_type}_{channel_name}/test_rmse": rmse,
-                f"prober_{model_type}_{repr_type}_{channel_name}/test_r2": mean_r2
+                f"prober_{model_type}_{repr_type}_{channel_name}/test_loss": mean_loss
             })
         
         # Visualize results if requested
@@ -795,8 +782,6 @@ class ProbingEvaluator:
                 'ReprType': repr_type,
                 'Channel': channel_name,
                 'MSE': metrics['mean_loss'],
-                'RMSE': metrics['rmse'],
-                'R²': metrics['r2_score']
             })
         
         # Sort by model type, representation type, then channel
@@ -804,13 +789,14 @@ class ProbingEvaluator:
         
         # Print summary table
         logger.info("\n--- Probing Results Summary ---")
-        logger.info(f"{'Model':<10} {'ReprType':<10} {'Channel':<25} {'MSE':<10} {'RMSE':<10} {'R²':<10}")
-        logger.info("-" * 75)
+        logger.info(f"{'Model':<10} {'ReprType':<10} {'Channel':<25} {'MSE':<10}")
+        logger.info("-" * 57) # Adjusted length
         
         for row in summary:
+            # Update row format
             logger.info(
                 f"{row['Model']:<10} {row['ReprType']:<10} {row['Channel']:<25} "
-                f"{row['MSE']:<10.6f} {row['RMSE']:<10.6f} {row['R²']:<10.6f}"
+                f"{row['MSE']:<10.6f}"
             )
         
         # Save summary to JSON
@@ -820,19 +806,18 @@ class ProbingEvaluator:
         
         # Log summary to WandB
         if self.use_wandb:
-            # Create a table
+            # Create a table with updated columns
             wandb_table = wandb.Table(
-                columns=["Model", "ReprType", "Channel", "MSE", "RMSE", "R²"]
+                columns=["Model", "ReprType", "Channel", "MSE"]
             )
             
             for row in summary:
+                # Update data added to table
                 wandb_table.add_data(
                     row['Model'],
                     row['ReprType'],
                     row['Channel'],
-                    row['MSE'],
-                    row['RMSE'],
-                    row['R²']
+                    row['MSE']
                 )
             
             self.wandb_run.log({"probing_summary": wandb_table})
@@ -852,116 +837,11 @@ class ProbingEvaluator:
             logger.info("Skipping comparative visualizations (save_visualizations disabled)")
             return
             
-        # Group by model and representation type
-        models = sorted(list(set(row['Model'] for row in summary)))
-        repr_types = sorted(list(set(row['ReprType'] for row in summary)))
+        # REMOVING R2-based bar plot visualization
+        logger.info("R2-based comparative bar plot visualization removed.")
         
-        num_models = len(models)
-        num_repr_types = len(repr_types)
-        
-        # Create figure with subplots - 1 for each model and repr_type combination
-        fig, axes = plt.subplots(num_models, num_repr_types, figsize=(6*num_repr_types, 8*num_models))
-        # Handle single subplot case
-        if num_models * num_repr_types == 1:
-            axes = np.array([[axes]])
-        elif num_models == 1:
-            axes = np.array([axes])
-        elif num_repr_types == 1:
-            axes = np.array([[ax] for ax in axes])
-        
-        for i, model in enumerate(models):
-            for j, repr_type in enumerate(repr_types):
-                # Get results for this model and repr_type
-                results = [row for row in summary if row['Model'] == model and row['ReprType'] == repr_type]
-                
-                if not results:
-                    continue
-                
-                # Sort by R² score to see best-to-worst channels
-                results.sort(key=lambda x: x['R²'], reverse=True)
-                
-                channels = [row['Channel'] for row in results]
-                r2_scores = [row['R²'] for row in results]
-                
-                # Create horizontal bar chart
-                y_pos = np.arange(len(channels))
-                axes[i, j].barh(y_pos, r2_scores, align='center')
-                axes[i, j].set_yticks(y_pos)
-                axes[i, j].set_yticklabels(channels)
-                axes[i, j].invert_yaxis()  # Labels read top-to-bottom
-                axes[i, j].set_xlabel('R² Score')
-                axes[i, j].set_title(f'{model.capitalize()} Model - {repr_type.capitalize()} Representations')
-                
-                # Add grid for readability
-                axes[i, j].grid(axis='x', linestyle='--', alpha=0.7)
-                
-                # Add a line at R²=0
-                axes[i, j].axvline(x=0, color='r', linestyle='-', alpha=0.3)
-                
-                # Make sure all axes have same x limits for fair comparison
-                axes[i, j].set_xlim(min(-0.1, min(r2_scores) - 0.1), max(1.0, max(r2_scores) + 0.1))
-                
-        plt.tight_layout()
-        plt_path = self.output_dir / "comparative_results.png"
-        plt.savefig(plt_path)
-        
-        if self.use_wandb:
-            self.wandb_run.log({"comparative_results": wandb.Image(plt)})
-            
-        plt.close(fig)
-        
-        # Also create a direct comparison between encoder and predictor for the same channels
-        if len(repr_types) > 1:
-            # Get all channels from summary
-            all_channels = sorted(list(set(row['Channel'] for row in summary)))
-            
-            # For each model, compare encoder vs predictor performance
-            for model in models:
-                fig, ax = plt.subplots(figsize=(10, 8))
-                
-                # Get encoder and predictor results for this model
-                encoder_results = {row['Channel']: row['R²'] for row in summary if row['Model'] == model and row['ReprType'] == 'encoder'}
-                predictor_results = {row['Channel']: row['R²'] for row in summary if row['Model'] == model and row['ReprType'] == 'predictor'}
-                
-                # Filter for channels that have both encoder and predictor results
-                common_channels = sorted([ch for ch in all_channels if ch in encoder_results and ch in predictor_results])
-                
-                if not common_channels:
-                    plt.close(fig)
-                    continue
-                
-                encoder_scores = [encoder_results[ch] for ch in common_channels]
-                predictor_scores = [predictor_results[ch] for ch in common_channels]
-                
-                # Plot a scatter of encoder vs predictor R² scores
-                plt.scatter(encoder_scores, predictor_scores, alpha=0.7)
-                
-                # Add diagonal line for equal performance
-                min_val = min(min(encoder_scores), min(predictor_scores)) - 0.1
-                max_val = max(max(encoder_scores), max(predictor_scores)) + 0.1
-                plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5)
-                
-                # Add channel labels
-                for i, ch in enumerate(common_channels):
-                    plt.annotate(ch, (encoder_scores[i], predictor_scores[i]), 
-                                fontsize=8, alpha=0.8)
-                
-                plt.xlabel('Encoder R² Score')
-                plt.ylabel('Predictor R² Score')
-                plt.title(f'{model.capitalize()} Model - Encoder vs Predictor Performance')
-                plt.grid(True, alpha=0.3)
-                
-                # Set equal aspect ratio
-                plt.axis('equal')
-                plt.tight_layout()
-                
-                comp_path = self.output_dir / f"{model}_encoder_vs_predictor.png"
-                plt.savefig(comp_path)
-                
-                if self.use_wandb:
-                    self.wandb_run.log({f"{model}_encoder_vs_predictor": wandb.Image(plt)})
-                    
-                plt.close(fig)
+        # REMOVING R2-based Encoder vs Predictor scatter plot visualization
+        logger.info("R2-based Encoder vs Predictor scatter plot visualization removed.")
 
 
 def main():
