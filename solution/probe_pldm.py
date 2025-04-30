@@ -12,6 +12,7 @@ from typing import Dict, List, Tuple, Optional, Any, Union, NamedTuple
 from dataclasses import dataclass
 import torch.nn.functional as F
 import gc  # Import garbage collection
+import inspect
 
 # Add the parent directory to the path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -243,6 +244,7 @@ class ProbingEvaluator:
         # Move to device
         state = state.to(self.device)
         action = action.to(self.device)
+        next_state = next_state.to(self.device) # Ensure next_state is also on device
         
         # Get the appropriate model
         if model_type == 'dynamics':
@@ -250,41 +252,46 @@ class ProbingEvaluator:
         else:  # reward
             model = self.model.reward_model
         
+        # Check if CNN encoder exists and should be used
+        # Assumes self.model is the PLDMTrainer instance or has similar attributes
+        use_cnn = hasattr(self.model, 'cnn_encoder') and self.model.cnn_encoder is not None
+        
         # Extract representation based on type
         with torch.no_grad():
+            if use_cnn and self.model_type == 'grid':
+                # Use CNN encoder first
+                state_embed = self.model.cnn_encoder(state)
+                next_state_embed = self.model.cnn_encoder(next_state)
+            else:
+                # Use raw state if no CNN or not grid model
+                state_embed = state
+                next_state_embed = next_state
+                
+            # Now use the embeddings (or raw states) with the predictor/encoder logic
             if repr_type == 'encoder':
-                # Get encoder representation from just the state
-                if hasattr(model, 'encoder') and callable(getattr(model, 'encoder')):
-                    representation = model.encoder(state)
-                elif hasattr(model, 'encode'):
-                    # Try to get encoder representation if encode method exists
-                    representation = model.encode(state, None)
-                else:
-                    # Fallback to full model with a flag
-                    representation = model(state, action, return_embedding=True)
+                # For encoder probing, we want the representation *before* the predictor
+                # If CNN was used, state_embed is the CNN output. Otherwise, it's raw state.
+                # If the model itself is just an encoder (e.g., CNNStateEncoderNetwork passed directly), 
+                # we might need different logic, but here we assume model is Dynamics/Reward Predictor.
+                # Let's return state_embed which is either raw state or CNN output
+                representation = state_embed
             else:  # predictor
-                # Get predictor representation after processing state+action
-                if hasattr(model, 'predictor') and callable(getattr(model, 'predictor')):
-                    # First get encoder representation
-                    if hasattr(model, 'encoder') and callable(getattr(model, 'encoder')):
-                        encoded = model.encoder(state)
-                    elif hasattr(model, 'encode'):
-                        encoded = model.encode(state, None)
-                    else:
-                        encoded = model(state, action, return_embedding=True)
-                    
-                    # Then pass through predictor
-                    representation = model.predictor(encoded, action)
+                # For predictor probing, we want the output of the dynamics/reward predictor
+                # The predictor takes the state embedding (or raw state) and action
+                
+                # Check if model is Transformer or similar that needs return_embedding=True for predictor's internal rep
+                from solution.pldm.predictors import TransformerPredictor, LSTMPredictor
+                if isinstance(model, (TransformerPredictor, LSTMPredictor)):
+                     # These models predict the *next* state embedding when return_embedding=True
+                    representation = model(state_embed, action, return_embedding=True)
+                elif hasattr(model, 'forward') and 'return_embedding' in inspect.signature(model.forward).parameters:
+                     # Other predictors might use return_embedding for their internal state
+                    representation = model(state_embed, action, return_embedding=True)
                 else:
-                    # Check if this is a TransformerPredictor
-                    # TransformerPredictor uses 'return_embedding' instead of 'return_pred'
-                    from solution.pldm.predictors import TransformerPredictor
-                    if isinstance(model, TransformerPredictor):
-                        # Use the standard parameter for TransformerPredictor
-                        representation = model(state, action, return_embedding=True)
-                    else:
-                        # Fallback to full model with output as representation
-                        representation = model(state, action, return_pred=True)
+                     # Fallback: use the standard output of the model as the representation
+                    # For dynamics, this might be the predicted next state grid/vector (not embedding)
+                    # For reward, this would be the scalar reward
+                    representation = model(state_embed, action)
                 
         return representation
 

@@ -292,6 +292,8 @@ class StateEncoderNetwork(nn.Module):
         if self.dynamic_net and not self.initialized:
             _, _, self.grid_height, self.grid_width = x.shape
             self._build_network()
+            # Ensure dynamically created layers are on the correct device
+            self.to(x.device)
         
         # Input shape: [batch_size, channels, height, width]
         x = F.relu(self.conv1(x))

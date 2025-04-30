@@ -12,6 +12,7 @@ from pathlib import Path
 import torch.nn.functional as F
 import logging # Import logging
 from tqdm import tqdm # Import tqdm
+import inspect
 
 # Attempt to import wandb, but don't fail if it's not installed
 try:
@@ -21,12 +22,12 @@ except ImportError:
     wandb = None
     WANDB_AVAILABLE = False
 
-from .state_encoder import GridStateEncoder, VectorStateEncoder, StateEncoderNetwork, VectorEncoderNetwork
+from .state_encoder import GridStateEncoder, VectorStateEncoder, StateEncoderNetwork
 from .dynamics_predictor import GridDynamicsPredictor, VectorDynamicsPredictor, SharedEncoderDynamicsPredictor
 from .reward_predictor import GridRewardPredictor, VectorRewardPredictor, SharedEncoderRewardPredictor
 from .data_processor import get_overcooked_dataloaders
-from .objectives import get_loss_function, MSELoss, VICRegLoss
-from .predictors import TransformerPredictor
+from .objectives import get_loss_function, MSELoss, VICRegLoss, VICRegConfig, MSELossInfo, VICRegLossInfo # Corrected info object imports
+from .predictors import TransformerPredictor, create_dynamics_predictor, create_reward_predictor # Keep create functions
 
 # Get a logger for this module
 logger = logging.getLogger(__name__)
@@ -62,7 +63,12 @@ class PLDMTrainer:
         wandb_run=None, # Pass wandb run object (optional)
         disable_artifacts=True, # Disable WandB artifacts by default
         config=None,  # Added configuration parameter
-        teacher_forcing_ratio=0.5  # Added teacher forcing ratio
+        teacher_forcing_ratio=0.5,  # Added teacher forcing ratio
+        weight_decay=0.0,  # Added weight decay parameter
+        max_norm=0.0,  # Added gradient clipping parameter
+        train_loader=None,
+        val_loader=None,
+        test_loader=None
     ):
         # Setup output directory
         self.output_dir = Path(output_dir)
@@ -83,6 +89,8 @@ class PLDMTrainer:
         self.disable_artifacts = disable_artifacts
         self.config = config or {}  # Store config or use empty dict
         self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.weight_decay = weight_decay
+        self.max_norm = max_norm
         
         # Handle grid dimensions that might be None or strings
         if grid_height is not None and not isinstance(grid_height, int):
@@ -132,6 +140,18 @@ class PLDMTrainer:
         elif model_type == "grid":
             self.state_encoder = GridStateEncoder(grid_height=self.grid_height, grid_width=self.grid_width)
             logger.info(f"Initialized GridStateEncoder (grid_height={self.grid_height}, grid_width={self.grid_width})")
+            
+            # Initialize CNN encoder if specified in config
+            if config and config.get("model", {}).get("encoder_type") == "cnn":
+                logger.info("Using CNNStateEncoderNetwork for state encoding")
+                self.cnn_encoder = StateEncoderNetwork(
+                    input_channels=32,  # Default number of channels in GridStateEncoder
+                    state_embed_dim=config.get("model", {}).get("state_embed_dim", 128),
+                    grid_height=self.grid_height,
+                    grid_width=self.grid_width
+                ).to(self.device)
+            else:
+                self.cnn_encoder = None
         else:  # model_type == "vector"
             self.state_encoder = VectorStateEncoder(grid_height=self.grid_height, grid_width=self.grid_width)
             logger.info(f"Initialized VectorStateEncoder (grid_height={self.grid_height}, grid_width={self.grid_width} used for normalization)")
@@ -181,740 +201,910 @@ class PLDMTrainer:
             sample_batch = next(iter(self.train_loader))
             state, action, next_state, reward = sample_batch
             logger.info("Got sample batch for model initialization.")
+
+            # Information about grid size (if applicable)
+            if self.model_type == "grid":
+                if len(state.shape) < 4:
+                    logger.error(f"Expected grid state (4D tensor) but got shape {state.shape}. Check data loading or model_type config.")
+                    raise ValueError(f"Incorrect state shape for grid model: {state.shape}")
+                batch_size, num_channels, grid_height, grid_width = state.shape
+                logger.info(f"Grid dimensions: {grid_height}x{grid_width} with {num_channels} channels")
+
+                # Set grid dimensions if not already specified in config
+                if self.grid_height is None or self.grid_width is None:
+                    self.grid_height = grid_height
+                    self.grid_width = grid_width
+                    logger.info(f"Updated grid dimensions to {self.grid_height}x{self.grid_width}")
+                elif self.grid_height != grid_height or self.grid_width != grid_width:
+                    logger.warning(f"Config grid dims ({self.grid_height}x{self.grid_width}) mismatch data ({grid_height}x{grid_width}). Using data dims.")
+                    self.grid_height = grid_height
+                    self.grid_width = grid_width
+
+                input_dim = num_channels # For GridStateEncoder or initial CNN layer
+                state_repr_dim = grid_height * grid_width * num_channels # Initial state representation dimension (flattened grid)
+
+            elif self.model_type == "vector":
+                if len(state.shape) != 2:
+                     logger.error(f"Expected vector state (2D tensor) but got shape {state.shape}.")
+                     raise ValueError(f"Incorrect state shape for vector model: {state.shape}")
+                batch_size, state_dim = state.shape
+                input_dim = state_dim
+                state_repr_dim = state_dim # Vector representation is just the input dim
+                logger.info(f"Vector state dimension: {state_dim}")
+            else:
+                raise ValueError(f"Unsupported model_type: {self.model_type}")
+
+            # Get action dimension
+            if len(action.shape) == 1: # Assume scalar actions need embedding
+                 action_dim = 1 # Will be embedded later
+                 self.num_actions = action.max().item() + 1 if action.numel() > 0 else self.num_actions # Infer if possible
+                 logger.info(f"Scalar action detected. Inferred num_actions: {self.num_actions}")
+            elif len(action.shape) == 2:
+                 action_dim = action.shape[1]
+                 logger.info(f"Vector action dimension: {action_dim}")
+            else:
+                 raise ValueError(f"Unsupported action shape: {action.shape}")
+
         except StopIteration:
-             logger.error("Data loader is empty. Cannot initialize models.")
-             raise ValueError("Data loader is empty.")
+            logger.error("Training loader is empty, cannot initialize models.")
+            raise ValueError("Cannot initialize models from empty data loader.")
         except Exception as e:
-            logger.error(f"Error getting sample batch: {e}")
+            logger.error(f"Error getting sample batch for model init: {e}", exc_info=True)
             raise
-        
-        # Get model configuration
+
+        # --- State Encoder Initialization ---
         model_config = self.config.get("model", {})
-        dynamics_predictor_config = model_config.get("dynamics_predictor", {})
-        reward_predictor_config = model_config.get("reward_predictor", {})
+        if self.state_encoder is None: # Only initialize if not provided externally
+            if self.model_type == "grid":
+                # Always start with GridStateEncoder for grid models
+                self.state_encoder = GridStateEncoder(grid_height=self.grid_height, grid_width=self.grid_width)
+                logger.info(f"Initialized GridStateEncoder (grid_height={self.grid_height}, grid_width={self.grid_width})")
+
+                # Optionally add CNN on top
+                if self.config.get("model", {}).get("encoder_type") == "cnn":
+                    logger.info("Using CNNStateEncoderNetwork for state encoding")
+                    cnn_config = {
+                        "input_channels": model_config.get("in_channels", 32), # Ensure this matches grid encoder output
+                        "hidden_channels": model_config.get("hidden_channels", [16, 32, 64]),
+                        "fc_dims": model_config.get("fc_dims", [256, 128]),
+                        "output_dim": self.state_embed_dim, # Use state_embed_dim from config
+                        "grid_height": self.grid_height,
+                        "grid_width": self.grid_width,
+                        "activation": model_config.get("activation", "relu"),
+                        "use_layer_norm": model_config.get("use_layer_norm", False),
+                        "dynamic_net": False # Initialize immediately
+                    }
+                    self.cnn_encoder = StateEncoderNetwork(**cnn_config)
+                    # The final state representation dim comes from the CNN
+                    state_repr_dim = self.state_embed_dim
+                    logger.info(f"Initialized CNNStateEncoderNetwork with output dimension: {state_repr_dim}")
+                else:
+                    # If not CNN, the representation is the flattened output of GridStateEncoder
+                    # Calculate this based on GridStateEncoder logic (if needed)
+                    # For simplicity, assume predictors handle raw grid input directly if no CNN
+                    state_repr_dim = self.grid_height * self.grid_width * model_config.get("in_channels", 32) # Example placeholder
+                    logger.info(f"Using raw grid state representation (dim: {state_repr_dim})")
+
+            elif self.model_type == "vector":
+                self.state_encoder = VectorStateEncoder(input_dim=input_dim) # Simple identity or MLP encoder
+                state_repr_dim = self.state_encoder.output_dim # Get actual output dim
+                logger.info(f"Initialized VectorStateEncoder with output dimension: {state_repr_dim}")
+        else:
+             logger.info("Using provided state encoder.")
+             # Need to determine the output dimension of the provided encoder
+             # This is tricky without knowing the encoder type, assume it has an 'output_dim' attribute
+             if hasattr(self.state_encoder, 'output_dim'):
+                 state_repr_dim = self.state_encoder.output_dim
+             else:
+                 # Attempt to infer by passing dummy data (might be risky)
+                 try:
+                     dummy_output = self.state_encoder(state.to(self.device))
+                     state_repr_dim = dummy_output.shape[-1]
+                     logger.info(f"Inferred state encoder output dimension: {state_repr_dim}")
+                 except Exception as e:
+                     logger.error(f"Could not determine output dimension of provided state encoder: {e}")
+                     # Fallback or raise error
+                     state_repr_dim = self.state_embed_dim # Fallback to config value
+                     logger.warning(f"Falling back to config state_embed_dim: {state_repr_dim}")
+
+
+        logger.info(f"Final state representation dimension for predictors: {state_repr_dim}")
+        logger.info(f"Action dimension: {action_dim}")
+
+
+        # --- Predictor Initialization ---
+        dyn_pred_config = self.get_predictor_config('dynamics')
+        rew_pred_config = self.get_predictor_config('reward')
+
+        # Create Dynamics Predictor
+        if self.config.get("training", {}).get("train_dynamics", True):
+            try:
+                self.dynamics_model = create_dynamics_predictor(
+                    config=dyn_pred_config,
+                    input_dim=state_repr_dim, # Use final state repr dim
+                    output_dim=state_repr_dim # Dynamics typically predicts next state repr
+                ).to(self.device)
+                logger.info(f"Initialized dynamics model: {type(self.dynamics_model).__name__}")
+            except Exception as e:
+                logger.error(f"Failed to initialize dynamics predictor: {e}", exc_info=True)
+                raise
+
+        # Create Reward Predictor
+        if self.config.get("training", {}).get("train_reward", True):
+            try:
+                self.reward_model = create_reward_predictor(
+                    config=rew_pred_config,
+                    input_dim=state_repr_dim # Use final state repr dim
+                ).to(self.device)
+                logger.info(f"Initialized reward model: {type(self.reward_model).__name__}")
+            except Exception as e:
+                logger.error(f"Failed to initialize reward predictor: {e}", exc_info=True)
+                raise
+
+
+    def get_predictor_config(self, model_type='dynamics'):
+        """
+        Get the predictor configuration from the config dictionary.
         
-        # Get predictor types
-        dynamics_predictor_type = dynamics_predictor_config.get("predictor_type", self.model_type)
-        reward_predictor_type = reward_predictor_config.get("predictor_type", self.model_type)
+        Args:
+            model_type: 'dynamics' or 'reward'
+            
+        Returns:
+            Configuration dictionary for the predictor
+        """
+        model_config = self.config.get("model", {})
         
-        logger.info(f"Initializing models - Dynamics: {dynamics_predictor_type}, Reward: {reward_predictor_type}")
-        
-        # Get state shape
-        if self.model_type == "grid":
-            batch_size, num_channels, grid_height, grid_width = state.shape
-            
-            # Update grid dimensions if not explicitly set
-            if self.grid_height is None:
-                self.grid_height = grid_height
-            if self.grid_width is None:
-                self.grid_width = grid_width
-                
-            logger.info(f"Initializing grid models with dimensions: channels={num_channels}, height={self.grid_height}, width={self.grid_width}")
-            
-            # Initialize dynamics model based on predictor type
-            if dynamics_predictor_type.lower() == "transformer":
-                # For transformer predictor with grid state
-                state_embed_dim = dynamics_predictor_config.get("hidden_size", self.state_embed_dim)
-                num_layers = dynamics_predictor_config.get("num_layers", 2)
-                num_heads = dynamics_predictor_config.get("nhead", 4)
-                dropout = dynamics_predictor_config.get("dropout", 0.1)
-                
-                # Flattened grid dimensions for transformer input
-                input_dim = num_channels * self.grid_height * self.grid_width
-                output_dim = num_channels * self.grid_height * self.grid_width
-                
-                self.dynamics_model = TransformerPredictor(
-                    input_dim=input_dim,
-                    output_dim=output_dim,
-                    num_actions=self.num_actions,
-                    action_embed_dim=self.action_embed_dim,
-                    hidden_size=state_embed_dim,
-                    num_layers=num_layers,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    is_reward=False,
-                    teacher_forcing_ratio=self.teacher_forcing_ratio
-                ).to(self.device)
-                
-                logger.info(f"Initialized TransformerPredictor for dynamics with teacher_forcing_ratio={self.teacher_forcing_ratio}")
-            else:
-                # Default grid dynamics predictor
-                self.dynamics_model = GridDynamicsPredictor(
-                    state_embed_dim=self.state_embed_dim,
-                    action_embed_dim=self.action_embed_dim,
-                    num_actions=self.num_actions,
-                    hidden_dim=self.dynamics_hidden_dim,
-                    num_channels=num_channels,
-                    grid_height=self.grid_height,
-                    grid_width=self.grid_width
-                ).to(self.device)
-            
-            # Initialize reward model based on predictor type
-            if reward_predictor_type.lower() == "transformer":
-                # For transformer predictor with grid state
-                state_embed_dim = reward_predictor_config.get("hidden_size", self.state_embed_dim)
-                num_layers = reward_predictor_config.get("num_layers", 2)
-                num_heads = reward_predictor_config.get("nhead", 4)
-                dropout = reward_predictor_config.get("dropout", 0.1)
-                
-                # Flattened grid dimensions for transformer input
-                input_dim = num_channels * self.grid_height * self.grid_width
-                
-                self.reward_model = TransformerPredictor(
-                    input_dim=input_dim,
-                    output_dim=1,  # Reward is a scalar
-                    num_actions=self.num_actions,
-                    action_embed_dim=self.action_embed_dim,
-                    hidden_size=state_embed_dim,
-                    num_layers=num_layers,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    is_reward=True,
-                    teacher_forcing_ratio=self.teacher_forcing_ratio
-                ).to(self.device)
-                
-                logger.info(f"Initialized TransformerPredictor for reward with teacher_forcing_ratio={self.teacher_forcing_ratio}")
-            else:
-                # Default grid reward predictor
-                self.reward_model = GridRewardPredictor(
-                    state_embed_dim=self.state_embed_dim,
-                    action_embed_dim=self.action_embed_dim,
-                    num_actions=self.num_actions,
-                    hidden_dim=self.reward_hidden_dim,
-                    num_channels=num_channels,
-                    grid_height=self.grid_height,
-                    grid_width=self.grid_width
-                ).to(self.device)
-            
-            # Determine input dimensions for VICReg loss if used
-            dynamics_input_dim = num_channels * grid_height * grid_width
-            reward_input_dim = 1  # Reward is a scalar
-            
-        else:  # model_type == "vector"
-            batch_size, state_dim = state.shape
-            logger.info(f"Initializing vector models with state_dim={state_dim}")
-            
-            # Initialize dynamics model based on predictor type
-            if dynamics_predictor_type.lower() == "transformer":
-                # For transformer predictor with vector state
-                state_embed_dim = dynamics_predictor_config.get("hidden_size", self.state_embed_dim)
-                num_layers = dynamics_predictor_config.get("num_layers", 2)
-                num_heads = dynamics_predictor_config.get("nhead", 4)
-                dropout = dynamics_predictor_config.get("dropout", 0.1)
-                
-                self.dynamics_model = TransformerPredictor(
-                    input_dim=state_dim,
-                    output_dim=state_dim,
-                    num_actions=self.num_actions,
-                    action_embed_dim=self.action_embed_dim,
-                    hidden_size=state_embed_dim,
-                    num_layers=num_layers,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    is_reward=False,
-                    teacher_forcing_ratio=self.teacher_forcing_ratio
-                ).to(self.device)
-                
-                logger.info(f"Initialized TransformerPredictor for dynamics with teacher_forcing_ratio={self.teacher_forcing_ratio}")
-            else:
-                # Default vector dynamics predictor
-                self.dynamics_model = VectorDynamicsPredictor(
-                    state_dim=state_dim,
-                    action_embed_dim=self.action_embed_dim,
-                    num_actions=self.num_actions,
-                    hidden_dim=self.dynamics_hidden_dim
-                ).to(self.device)
-            
-            # Initialize reward model based on predictor type
-            if reward_predictor_type.lower() == "transformer":
-                # For transformer predictor with vector state
-                state_embed_dim = reward_predictor_config.get("hidden_size", self.state_embed_dim)
-                num_layers = reward_predictor_config.get("num_layers", 2)
-                num_heads = reward_predictor_config.get("nhead", 4)
-                dropout = reward_predictor_config.get("dropout", 0.1)
-                
-                self.reward_model = TransformerPredictor(
-                    input_dim=state_dim,
-                    output_dim=1,  # Reward is a scalar
-                    num_actions=self.num_actions,
-                    action_embed_dim=self.action_embed_dim,
-                    hidden_size=state_embed_dim,
-                    num_layers=num_layers,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    is_reward=True,
-                    teacher_forcing_ratio=self.teacher_forcing_ratio
-                ).to(self.device)
-                
-                logger.info(f"Initialized TransformerPredictor for reward with teacher_forcing_ratio={self.teacher_forcing_ratio}")
-            else:
-                # Default vector reward predictor
-                self.reward_model = VectorRewardPredictor(
-                    state_dim=state_dim,
-                    action_embed_dim=self.action_embed_dim,
-                    num_actions=self.num_actions,
-                    hidden_dim=self.reward_hidden_dim
-                ).to(self.device)
-            
-            # Determine input dimensions for VICReg loss if used
-            dynamics_input_dim = state_dim
-            reward_input_dim = 1  # Reward is a scalar
-        
-        # Initialize optimizers
-        self.dynamics_optimizer = optim.Adam(self.dynamics_model.parameters(), lr=self.lr)
-        self.reward_optimizer = optim.Adam(self.reward_model.parameters(), lr=self.lr)
-        logger.info("Optimizers initialized.")
-        
-        # Initialize loss functions based on configuration
+        if model_type == 'dynamics':
+            predictor_config = model_config.get("dynamics_predictor", {})
+            # Set defaults based on trainer attributes if keys missing in config
+            predictor_config.setdefault("predictor_type", self.model_type) # Default to grid/vector
+            predictor_config.setdefault("hidden_size", self.dynamics_hidden_dim)
+            predictor_config.setdefault("num_actions", self.num_actions)
+            predictor_config.setdefault("action_embed_dim", self.action_embed_dim)
+            # Add other dynamics-specific defaults from model_config if needed
+        elif model_type == 'reward':
+            predictor_config = model_config.get("reward_predictor", {})
+            # Set defaults
+            predictor_config.setdefault("predictor_type", self.model_type) # Default to grid/vector
+            predictor_config.setdefault("hidden_size", self.reward_hidden_dim)
+            predictor_config.setdefault("num_actions", self.num_actions)
+            predictor_config.setdefault("action_embed_dim", self.action_embed_dim)
+            # Add other reward-specific defaults from model_config if needed
+        else:
+            raise ValueError(f"Unknown model_type for predictor config: {model_type}")
+
+        # Add general params that might be needed by predictors
+        predictor_config.setdefault("activation", model_config.get("activation", "relu"))
+        predictor_config.setdefault("use_layer_norm", model_config.get("use_layer_norm", False))
+        predictor_config.setdefault("teacher_forcing_ratio", model_config.get("teacher_forcing_ratio", 0.0)) # For RNN/Transformers
+
+        return predictor_config
+
+
+    def _initialize_optimizers(self):
+        """Initialize optimizers for the models."""
+        if self.dynamics_model:
+            self.dynamics_optimizer = self._create_optimizer(self.dynamics_model)
+            logger.info(f"Initialized dynamics optimizer: {self.config.get('optimizer', 'adam')}")
+        if self.reward_model:
+            self.reward_optimizer = self._create_optimizer(self.reward_model)
+            logger.info(f"Initialized reward optimizer: {self.config.get('optimizer', 'adam')}")
+        # Add CNN encoder parameters if it exists and is trainable
+        if self.cnn_encoder and self.config.get("training", {}).get("train_dynamics", True): # Assuming CNN trained with dynamics
+             # Create a separate optimizer or add params to dynamics optimizer?
+             # Adding to dynamics optimizer for simplicity
+             logger.info("Adding CNN encoder parameters to dynamics optimizer.")
+             self.dynamics_optimizer.add_param_group({'params': self.cnn_encoder.parameters()})
+
+
+    def _create_optimizer(self, model):
+        """Helper function to create an optimizer instance."""
+        optimizer_type = self.config.get("optimizer", "adam").lower()
+        if optimizer_type == "adam":
+            return optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        elif optimizer_type == "adamw":
+             return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        elif optimizer_type == "sgd":
+            return optim.SGD(model.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
+        else:
+            logger.warning(f"Unsupported optimizer type: {optimizer_type}. Defaulting to Adam.")
+            return optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+
+    def _initialize_loss_functions(self):
+        """Initialize loss functions based on configuration."""
         loss_config = self.config.get("loss", {})
         dynamics_loss_type = loss_config.get("dynamics_loss", "mse")
         reward_loss_type = loss_config.get("reward_loss", "mse")
-        vicreg_config = loss_config.get("vicreg", {})
         
         logger.info(f"Initializing loss functions - Dynamics: {dynamics_loss_type}, Reward: {reward_loss_type}")
         
         # Initialize dynamics loss
-        self.dynamics_criterion = get_loss_function(
-            loss_type=dynamics_loss_type,
-            model_type="dynamics",
-            input_dim=dynamics_input_dim,
-            config=vicreg_config if dynamics_loss_type.lower() == "vicreg" else None,
-            name_prefix="train"
-        )
-        
-        # Initialize reward loss
-        self.reward_criterion = get_loss_function(
-            loss_type=reward_loss_type,
-            model_type="reward",
-            input_dim=reward_input_dim,
-            config=vicreg_config if reward_loss_type.lower() == "vicreg" else None,
-            name_prefix="train"
-        )
-        
-        # Print the size of the model to verify
-        total_dynamics_params = sum(p.numel() for p in self.dynamics_model.parameters() if p.requires_grad)
-        total_reward_params = sum(p.numel() for p in self.reward_model.parameters() if p.requires_grad)
-        
-        logger.info(f"Initialized {self.model_type} models.")
-        logger.debug(f"Dynamics model: {self.dynamics_model}")
-        logger.debug(f"Reward model: {self.reward_model}")
-        logger.info(f"Total trainable parameters - Dynamics: {total_dynamics_params:,}, Reward: {total_reward_params:,}")
+        if self.config.get("training", {}).get("train_dynamics", True):
+            if dynamics_loss_type.lower() == "vicreg":
+                vicreg_config_dict = loss_config.get("vicreg", {})
+                # Create VICRegConfig object
+                vicreg_config_obj = VICRegConfig(**vicreg_config_dict)
 
-    def train_episode(self, episode_data):
-        """
-        Train the dynamics and reward models on a single episode.
-        
-        Args:
-            episode_data: List of (state, action, next_state, reward) tuples
-            
-        Returns:
-            Tuple of (dynamics_loss, reward_loss)
-        """
-        if not episode_data:
-            return 0.0, 0.0
-        
-        # Cumulative losses for this episode
-        episode_dynamics_loss = 0.0
-        episode_reward_loss = 0.0
-        
-        # Iterate over transitions in the episode
-        for state, action, next_state, reward in episode_data:
-            # Encode current and next states
-            state_grid = self.state_encoder.encode(state)
-            next_state_grid = self.state_encoder.encode(next_state)
-            
-            # Convert to PyTorch tensors
-            state_tensor = torch.FloatTensor(state_grid).unsqueeze(0).to(self.device)
-            action_tensor = torch.FloatTensor(action).unsqueeze(0).to(self.device)
-            next_state_tensor = torch.FloatTensor(next_state_grid).unsqueeze(0).to(self.device)
-            reward_tensor = torch.FloatTensor([reward]).to(self.device)
-            
-            # Train dynamics model
-            self.dynamics_optimizer.zero_grad()
-            predicted_next_state = self.dynamics_model(state_tensor, action_tensor)
-            dynamics_loss = F.mse_loss(predicted_next_state, next_state_tensor)
-            dynamics_loss.backward()
-            self.dynamics_optimizer.step()
-            
-            # Train reward model
-            self.reward_optimizer.zero_grad()
-            predicted_reward = self.reward_model(state_tensor, action_tensor)
-            reward_loss = F.mse_loss(predicted_reward, reward_tensor)
-            reward_loss.backward()
-            self.reward_optimizer.step()
-            
-            # Update episode loss metrics
-            episode_dynamics_loss += dynamics_loss.item()
-            episode_reward_loss += reward_loss.item()
-        
-        # Average losses over steps in episode
-        num_steps = len(episode_data)
-        episode_dynamics_loss /= num_steps
-        episode_reward_loss /= num_steps
-        
-        return episode_dynamics_loss, episode_reward_loss
-    
-    def save_hyperparameters(self):
-        """Save hyperparameters to a JSON file."""
-        hparams = {
-            'model_type': self.model_type,
-            'batch_size': self.batch_size,
-            'lr': self.lr,
-            'state_embed_dim': self.state_embed_dim,
-            'action_embed_dim': self.action_embed_dim,
-            'num_actions': self.num_actions,
-            'dynamics_hidden_dim': self.dynamics_hidden_dim,
-            'reward_hidden_dim': self.reward_hidden_dim,
-            'grid_height': self.grid_height,
-            'grid_width': self.grid_width,
-            'device': str(self.device),
-            'num_workers': self.num_workers
-        }
-        
-        with open(self.output_dir / 'hyperparameters.json', 'w') as f:
-            json.dump(hparams, f, indent=2)
-    
-    def train_dynamics(self, num_epochs: int = 10, log_interval: int = 10):
-        """
-        Train the dynamics predictor.
-        
-        Args:
-            num_epochs: Number of epochs to train
-            log_interval: Interval for logging training progress
-        """
-        if self.dynamics_model is None or self.train_loader is None:
-            logger.error("Cannot train dynamics: Models or data loaders not initialized")
-            raise ValueError("Models or data loaders not initialized")
-            
-        logger.info(f"Training dynamics predictor for {num_epochs} epochs...")
-        best_val_loss = float('inf')
-        start_time = time.time()
-        
-        for epoch in range(num_epochs):
-            epoch_start_time = time.time()
-            train_loss = self._train_epoch(
-                model=self.dynamics_model,
-                optimizer=self.dynamics_optimizer,
-                criterion=self.dynamics_criterion,
-                data_loader=self.train_loader,
-                is_dynamics=True,
-                log_interval=log_interval,
-                epoch=epoch # Pass epoch for wandb logging
-            )
-            
-            val_loss = self._validate(
-                model=self.dynamics_model,
-                criterion=self.dynamics_criterion,
-                data_loader=self.val_loader,
-                is_dynamics=True,
-                epoch=epoch # Pass epoch for wandb logging
-            )
-            
-            epoch_duration = time.time() - epoch_start_time
-            logger.info(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Duration: {epoch_duration:.2f}s")
-            
-            # Log metrics to WandB
-            if self.use_wandb:
-                wandb.log({
-                    "epoch": epoch + 1,
-                    "dynamics_train_loss": train_loss,
-                    "dynamics_val_loss": val_loss,
-                    "dynamics_epoch_duration_sec": epoch_duration
-                })
-            
-            # Save best model
-            if val_loss < best_val_loss:
-                logger.info(f"New best dynamics model found! Val loss improved from {best_val_loss:.6f} to {val_loss:.6f}")
-                best_val_loss = val_loss
-                self.save_model(self.dynamics_model, 'dynamics')
-                
-        total_training_time = time.time() - start_time
-        logger.info(f"Finished training dynamics model. Total time: {total_training_time:.2f}s")
-    
-    def train_reward(self, num_epochs: int = 10, log_interval: int = 10):
-        """
-        Train the reward predictor.
-        
-        Args:
-            num_epochs: Number of epochs to train
-            log_interval: Interval for logging training progress
-        """
-        if self.reward_model is None or self.train_loader is None:
-            logger.error("Cannot train reward: Models or data loaders not initialized")
-            raise ValueError("Models or data loaders not initialized")
-            
-        logger.info(f"Training reward predictor for {num_epochs} epochs...")
-        best_val_loss = float('inf')
-        start_time = time.time()
-        
-        for epoch in range(num_epochs):
-            epoch_start_time = time.time()
-            train_loss = self._train_epoch(
-                model=self.reward_model,
-                optimizer=self.reward_optimizer,
-                criterion=self.reward_criterion,
-                data_loader=self.train_loader,
-                is_dynamics=False,
-                log_interval=log_interval,
-                epoch=epoch # Pass epoch for wandb logging
-            )
-            
-            val_loss = self._validate(
-                model=self.reward_model,
-                criterion=self.reward_criterion,
-                data_loader=self.val_loader,
-                is_dynamics=False,
-                epoch=epoch # Pass epoch for wandb logging
-            )
-            
-            epoch_duration = time.time() - epoch_start_time
-            logger.info(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Duration: {epoch_duration:.2f}s")
-            
-            # Log metrics to WandB
-            if self.use_wandb:
-                 wandb.log({
-                    "epoch": epoch + 1,
-                    "reward_train_loss": train_loss,
-                    "reward_val_loss": val_loss,
-                    "reward_epoch_duration_sec": epoch_duration
-                })
+                # Determine projector input dimension
+                if self.model_type == "grid":
+                    proj_input_dim = self.state_embed_dim if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None else self.grid_height * self.grid_width * 32 # Placeholder channel num
+                else: # vector
+                    proj_input_dim = self.state_embed_dim # Assume state_embed_dim is set
 
-            # Save best model
-            if val_loss < best_val_loss:
-                logger.info(f"New best reward model found! Val loss improved from {best_val_loss:.6f} to {val_loss:.6f}")
-                best_val_loss = val_loss
-                self.save_model(self.reward_model, 'reward')
-                
-        total_training_time = time.time() - start_time
-        logger.info(f"Finished training reward model. Total time: {total_training_time:.2f}s")
-                
-    def _train_epoch(self, model, optimizer, criterion, data_loader, is_dynamics: bool, log_interval: int, epoch: int):
-        """
-        Train the model for one epoch.
-        
-        Args:
-            model: Model to train
-            optimizer: Optimizer for the model
-            criterion: Loss criterion
-            data_loader: DataLoader for training data
-            is_dynamics: Whether training dynamics (True) or reward (False)
-            log_interval: Interval for logging
-            epoch: Current epoch number (for logging)
-        
-        Returns:
-            Average loss for the epoch
-        """
-        model.train()
-        total_loss = 0
-        total_batches = 0
-        epoch_start_time = time.time()
-        
-        # Use tqdm for progress bar
-        data_iterator = tqdm(data_loader, desc=f"Epoch {epoch+1} Train", leave=False, unit="batch")
-
-        for batch_idx, (state, action, next_state, reward) in enumerate(data_iterator):
-            # Move data to device
-            state = state.to(self.device)
-            action = action.to(self.device)
-            
-            if is_dynamics:
-                target = next_state.to(self.device)
-                
-                # Check if model is a transformer type that supports teacher forcing
-                if isinstance(model, TransformerPredictor) and hasattr(model, 'teacher_forcing_ratio'):
-                    # Use teacher forcing during training
-                    output = model(state, action, target_state=target)
-                else:
-                    # Regular forward pass for other model types
-                    output = model(state, action)
-                
-                # Sometimes outputs can have different shapes due to padding
-                if output.shape != target.shape:
-                    # Resize output to match target (often needed for dynamics)
-                    output = torch.nn.functional.interpolate(
-                        output, size=target.shape[2:], mode='nearest')
+                self.dynamics_criterion = VICRegLoss(
+                    config=vicreg_config_obj,
+                    input_dim=proj_input_dim,
+                    device=self.device
+                )
+                logger.info(f"Using VICRegLoss for dynamics with config: {vicreg_config_obj}")
+            elif dynamics_loss_type.lower() == "mse":
+                self.dynamics_criterion = MSELoss()
+                logger.info("Using MSELoss for dynamics.")
             else:
-                # For reward prediction
-                reward = reward.to(self.device)
-                target = reward.unsqueeze(1) if reward.dim() == 1 else reward
-                output = model(state, action)
-                if output.dim() == 1: output = output.unsqueeze(1) # Ensure output is [batch, 1]
-                # Ensure shapes match (less common for reward, but possible)
-                if output.shape != target.shape:
-                    # This case is less expected for reward, log a warning
-                    logger.warning(f"Reward output shape {output.shape} mismatch with target {target.shape} in batch {batch_idx}. Attempting target reshape.")
-                    # Try reshaping target first
-                    try:
-                        target = target.view_as(output)
-                    except RuntimeError:
-                         logger.error("Could not reshape reward target to match output. Skipping loss calculation for this batch.")
-                         continue # Skip batch if shapes irreconcilable
-            
-            # Calculate loss using the criterion
-            try:
-                # Use the new loss function interface
-                loss_info = criterion(output, target)
-                loss = loss_info.total_loss
-                
-                # Log detailed loss components if available (for VICReg)
-                if hasattr(loss_info, 'build_log_dict') and self.use_wandb:
-                    wandb.log(loss_info.build_log_dict())
-            except Exception as loss_err:
-                logger.error(f"Error computing loss for batch {batch_idx}: {loss_err}. Output: {output.shape}, Target: {target.shape}")
-                continue # Skip batch if loss calculation fails
-            
-            # Backpropagation
+                raise ValueError(f"Unsupported dynamics_loss type: {dynamics_loss_type}")
+
+        # Initialize reward loss (assuming reward is always scalar or vector, MSE is common)
+        # Determine input dimension for VICReg projector if needed for reward
+        reward_projector_input_dim = None
+        if reward_loss_type.lower() == "vicreg" and self.reward_model:
+             # Reward model outputs scalar, VICReg typically needs embeddings.
+             # This setup seems unlikely. VICReg usually compares embeddings.
+             # If reward model outputs embeddings before final layer, use that dim.
+             logger.warning("Using VICRegLoss for scalar reward prediction is unusual. Ensure the reward model outputs suitable embeddings.")
+             # Try to infer based on reward model structure or use a default
+             reward_projector_input_dim = self.state_embed_dim # Default/Placeholder
+
+        if self.config.get("training", {}).get("train_reward", True):
+            if reward_loss_type.lower() == "vicreg":
+                vicreg_config_dict = loss_config.get("vicreg", {})
+                vicreg_config_obj = VICRegConfig(**vicreg_config_dict)
+
+                if reward_projector_input_dim is None:
+                     logger.error("Cannot initialize VICRegLoss for reward without projector_input_dim.")
+                     raise ValueError("VICReg projector input dimension could not be determined for reward.")
+
+                self.reward_criterion = VICRegLoss(
+                    config=vicreg_config_obj,
+                    input_dim=reward_projector_input_dim, # This might need adjustment based on reward model
+                    device=self.device
+                )
+                logger.info(f"Using VICRegLoss for reward with config: {vicreg_config_obj}")
+            elif reward_loss_type.lower() == "mse":
+                self.reward_criterion = MSELoss()
+                logger.info("Using MSELoss for reward.")
+            else:
+                raise ValueError(f"Unsupported reward_loss type: {reward_loss_type}")
+
+
+    def train_batch(self, model_type, batch, epoch, batch_idx, log_interval=10):
+        """
+        Train on a single batch of data.
+        
+        Args:
+            model_type: 'dynamics' or 'reward'
+            batch: Tuple of (state, action, next_state, reward)
+            epoch: Current epoch number (for logging)
+            batch_idx: Current batch index (for logging)
+            log_interval: How often to log training details
+        
+        Returns:
+            Loss value for this batch (float)
+        """
+        # Select the appropriate model, optimizer, and criterion
+        if model_type == 'dynamics':
+            model = self.dynamics_model
+            optimizer = self.dynamics_optimizer
+            criterion = self.dynamics_criterion
+        elif model_type == 'reward':
+            model = self.reward_model
+            optimizer = self.reward_optimizer
+            criterion = self.reward_criterion
+        else:
+            raise ValueError(f"Invalid model_type: {model_type}")
+
+        if model is None or optimizer is None or criterion is None:
+            logger.warning(f"Skipping training batch for {model_type}: Model, optimizer, or criterion not initialized.")
+            return 0.0 # Or None?
+
+        model.train()
+        # Ensure CNN encoder is also in train mode if used
+        if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None and model_type == 'dynamics':
+             self.cnn_encoder.train()
+
+        state, action, next_state, reward = batch
+        state = state.to(self.device)
+        action = action.to(self.device)
+        next_state = next_state.to(self.device)
+        reward = reward.to(self.device)
+
+        # --- Forward Pass ---
+        try:
+            # Handle state encoding (optional CNN)
+            if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None and self.model_type == 'grid':
+                state_repr = self.cnn_encoder(state)
+                next_state_repr = self.cnn_encoder(next_state) # Encode next state too if needed by loss
+            else:
+                state_repr = state # Use raw state if no CNN
+                next_state_repr = next_state
+
+            # Get model output (predicted next state repr or reward)
+            # Handle different model call signatures if necessary (e.g., teacher forcing)
+            if isinstance(model, TransformerPredictor):
+                 # Transformer might use teacher forcing
+                 teacher_forcing_ratio = self.config.get("model", {}).get("teacher_forcing_ratio", 0.0)
+                 output = model(state_repr, action, target_seq=next_state_repr, teacher_forcing_ratio=teacher_forcing_ratio)
+            else:
+                 output = model(state_repr, action)
+
+            # Determine the target based on model_type and loss
+            if model_type == 'dynamics':
+                # Dynamics model predicts next state representation
+                target = next_state_repr
+            else: # reward
+                # Reward model predicts scalar reward
+                target = reward.float().unsqueeze(1) # Ensure target is [batch_size, 1] float
+
+            # --- Loss Computation ---
+            # Both MSELoss and VICRegLoss return a single *Info object
+            loss_info = criterion(output, target)
+            loss = loss_info.total_loss # Extract the actual scalar loss from the info object
+
+        except Exception as e:
+            logger.error(f"Error during forward pass or loss computation for {model_type}: {e}", exc_info=True)
+            logger.error(f"Input state shape: {state.shape}, action shape: {action.shape}")
+            if 'state_repr' in locals(): logger.error(f"State representation shape: {state_repr.shape}")
+            if 'output' in locals(): logger.error(f"Model output shape: {output.shape}")
+            if 'target' in locals(): logger.error(f"Target shape: {target.shape}")
+            raise # Re-raise the exception to halt training
+
+        # --- Backpropagation ---
+        try:
             optimizer.zero_grad()
             loss.backward()
+            # Optional: Gradient clipping
+            if self.max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_norm)
+                if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None and model_type == 'dynamics':
+                     torch.nn.utils.clip_grad_norm_(self.cnn_encoder.parameters(), self.max_norm)
+
             optimizer.step()
-            
-            # Track loss
-            batch_loss = loss.item()
-            total_loss += batch_loss
-            total_batches += 1
-            
-            # Update tqdm progress bar
-            data_iterator.set_postfix(loss=f"{batch_loss:.6f}")
-            
-            # Log progress (less frequently with tqdm)
-            if batch_idx % log_interval == 0 and log_interval > 0:
-                # Log less verbosely when using tqdm
-                pass 
-                # logger.debug(f"Epoch {epoch+1} Batch {batch_idx}/{len(data_loader)} | Loss: {batch_loss:.6f}")
-        
-        data_iterator.close()
-        avg_loss = total_loss / total_batches if total_batches > 0 else 0.0
-        logger.debug(f"Epoch {epoch+1} Average Train Loss: {avg_loss:.6f}")
-        return avg_loss
-    
-    def _validate(self, model, criterion, data_loader, is_dynamics: bool, epoch: int):
+        except Exception as e:
+            logger.error(f"Error during backward pass or optimizer step for {model_type}: {e}", exc_info=True)
+            raise
+
+        # --- Logging ---
+        loss_val = loss.item()
+        if batch_idx % log_interval == 0:
+            log_msg = (
+                f"Train Epoch: {epoch+1} [{batch_idx * len(state)}/{len(self.train_loader.dataset)} "
+                f"({100. * batch_idx / len(self.train_loader):.0f}%)]\t{model_type.capitalize()} Loss: {loss_val:.6f}"
+            )
+            logger.info(log_msg)
+            if self.wandb_run:
+                log_data = {f"Train/{model_type}_batch_loss": loss_val}
+                # Log components of VICRegLoss if applicable
+                if isinstance(loss_info, VICRegLossInfo) and isinstance(criterion, VICRegLoss):
+                     log_data[f"Train/{model_type}_sim_loss"] = loss_info.sim_loss
+                     log_data[f"Train/{model_type}_std_loss"] = loss_info.std_loss
+                     log_data[f"Train/{model_type}_cov_loss"] = loss_info.cov_loss
+                self.wandb_run.log(log_data) # Log batch loss to wandb
+
+        return loss_val
+
+
+    def train_dynamics(self, epochs=None, log_interval=10):
         """
-        Validate the model.
+        Train the dynamics model for the specified number of epochs.
         
         Args:
-            model: Model to validate
-            criterion: Loss criterion
-            data_loader: DataLoader for validation data
-            is_dynamics: Whether validating dynamics (True) or reward (False)
-            epoch: Current epoch number (for logging)
+            epochs: Number of epochs to train for (defaults to config value).
+            log_interval: How often to log training metrics.
         
         Returns:
-            Average validation loss
+            Dictionary of training metrics.
         """
-        model.eval()
+        epochs = epochs if epochs is not None else self.config.get("training", {}).get("dynamics_epochs", 10)
+        logger.info(f"Training dynamics model for {epochs} epochs...")
+
+        if self.dynamics_model is None or self.dynamics_optimizer is None or self.dynamics_criterion is None:
+            logger.error("Dynamics model, optimizer, or criterion not initialized. Cannot train.")
+            return {"dynamics_train_loss": float('inf'), "dynamics_val_loss": float('inf')}
+
+        if self.train_loader is None or self.val_loader is None:
+             logger.error("Train or validation loader not available. Cannot train dynamics model.")
+             return {"dynamics_train_loss": float('inf'), "dynamics_val_loss": float('inf')}
+
+        best_val_loss = float('inf')
+        train_losses = []
+        val_losses = []
+        metrics = {}
+
+        # Track when training starts for benchmarking
+        start_time = time.time()
+
+        # Training loop
+        for epoch in range(epochs):
+            epoch_start_time = time.time()
+            self.dynamics_model.train() # Set model to training mode
+            # Also set CNN encoder to train mode if it exists
+            if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None:
+                 self.cnn_encoder.train()
+
+            total_train_loss = 0
+            num_batches = 0
+
+            # Wrap data loader with tqdm for progress bar
+            train_iterator = tqdm(self.train_loader, desc=f"Dynamics Epoch {epoch+1}/{epochs}", leave=False)
+            for batch_idx, batch in enumerate(train_iterator):
+                batch_loss = self.train_batch('dynamics', batch, epoch, batch_idx, log_interval)
+                total_train_loss += batch_loss
+                num_batches += 1
+                # Update tqdm description if needed
+                # train_iterator.set_postfix(loss=f"{batch_loss:.4f}")
+
+            avg_train_loss = total_train_loss / num_batches if num_batches > 0 else 0
+            train_losses.append(avg_train_loss)
+
+            # Validation phase
+            avg_val_loss = self.validate_dynamics()
+            val_losses.append(avg_val_loss)
+
+            epoch_end_time = time.time()
+            epoch_duration = epoch_end_time - epoch_start_time
+
+            logger.info(
+                f"Dynamics Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Time: {epoch_duration:.2f}s"
+            )
+
+            # WandB logging for epoch
+            if self.wandb_run:
+                log_epoch_data = {
+                    "Epoch": epoch + 1,
+                    "Dynamics/Train_Loss_Epoch": avg_train_loss,
+                    "Dynamics/Val_Loss_Epoch": avg_val_loss,
+                    "Dynamics/Epoch_Time": epoch_duration,
+                    "Dynamics/LR": self.dynamics_optimizer.param_groups[0]['lr'] # Log learning rate
+                }
+                self.wandb_run.log(log_epoch_data)
+
+            # Save best model based on validation loss
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                logger.info(f"New best dynamics validation loss: {best_val_loss:.4f}. Saving model...")
+                self.save_model('dynamics') # Saves dynamics_model.pt and potentially cnn_encoder.pt
+
+                # WandB save best metric
+                if self.wandb_run:
+                     self.wandb_run.summary["best_dynamics_val_loss"] = best_val_loss
+
+        end_time = time.time()
+        total_duration = end_time - start_time
+        logger.info(f"Finished training dynamics model. Total time: {total_duration:.2f}s")
+
+        metrics = {
+            "dynamics_train_losses": train_losses,
+            "dynamics_val_losses": val_losses,
+            "best_dynamics_val_loss": best_val_loss,
+            "total_dynamics_train_time": total_duration
+        }
+        return metrics
+
+
+    def train_reward(self, epochs=None, log_interval=10):
+        """
+        Train the reward model for the specified number of epochs.
+        
+        Args:
+            epochs: Number of epochs to train for (defaults to config value).
+            log_interval: How often to log training metrics.
+        
+        Returns:
+            Dictionary of training metrics.
+        """
+        epochs = epochs if epochs is not None else self.config.get("training", {}).get("reward_epochs", 10)
+        logger.info(f"Training reward model for {epochs} epochs...")
+
+        if self.reward_model is None or self.reward_optimizer is None or self.reward_criterion is None:
+            logger.error("Reward model, optimizer, or criterion not initialized. Cannot train.")
+            return {"reward_train_loss": float('inf'), "reward_val_loss": float('inf')}
+
+        if self.train_loader is None or self.val_loader is None:
+             logger.error("Train or validation loader not available. Cannot train reward model.")
+             return {"reward_train_loss": float('inf'), "reward_val_loss": float('inf')}
+
+        best_val_loss = float('inf')
+        train_losses = []
+        val_losses = []
+        metrics = {}
+
+        start_time = time.time()
+
+        # Training loop
+        for epoch in range(epochs):
+            epoch_start_time = time.time()
+            self.reward_model.train() # Set model to training mode
+            # Note: CNN encoder is typically NOT trained with reward model, kept frozen.
+
+            total_train_loss = 0
+            num_batches = 0
+
+            train_iterator = tqdm(self.train_loader, desc=f"Reward Epoch {epoch+1}/{epochs}", leave=False)
+            for batch_idx, batch in enumerate(train_iterator):
+                batch_loss = self.train_batch('reward', batch, epoch, batch_idx, log_interval)
+                total_train_loss += batch_loss
+                num_batches += 1
+
+            avg_train_loss = total_train_loss / num_batches if num_batches > 0 else 0
+            train_losses.append(avg_train_loss)
+
+            # Validation phase
+            avg_val_loss = self.validate_reward()
+            val_losses.append(avg_val_loss)
+
+            epoch_end_time = time.time()
+            epoch_duration = epoch_end_time - epoch_start_time
+
+            logger.info(
+                f"Reward Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Time: {epoch_duration:.2f}s"
+            )
+
+            # WandB logging
+            if self.wandb_run:
+                log_epoch_data = {
+                    "Epoch": epoch + 1,
+                    "Reward/Train_Loss_Epoch": avg_train_loss,
+                    "Reward/Val_Loss_Epoch": avg_val_loss,
+                    "Reward/Epoch_Time": epoch_duration,
+                    "Reward/LR": self.reward_optimizer.param_groups[0]['lr']
+                }
+                self.wandb_run.log(log_epoch_data)
+
+            # Save best model
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                logger.info(f"New best reward validation loss: {best_val_loss:.4f}. Saving model...")
+                self.save_model('reward')
+
+                if self.wandb_run:
+                     self.wandb_run.summary["best_reward_val_loss"] = best_val_loss
+
+
+        end_time = time.time()
+        total_duration = end_time - start_time
+        logger.info(f"Finished training reward model. Total time: {total_duration:.2f}s")
+
+        metrics = {
+            "reward_train_losses": train_losses,
+            "reward_val_losses": val_losses,
+            "best_reward_val_loss": best_val_loss,
+            "total_reward_train_time": total_duration
+        }
+        return metrics
+
+
+    def train_all(self):
+        """
+        Run the full training process for enabled models.
+        
+        Returns:
+            Dictionary containing training metrics for dynamics and reward models.
+        """
+        all_metrics = {}
+        logger.info("Starting PLDM training process...")
+
+        if self.config.get("training", {}).get("train_dynamics", True):
+            if self.dynamics_model:
+                logger.info("--- Training Dynamics Model ---")
+                dynamics_metrics = self.train_dynamics()
+                all_metrics.update(dynamics_metrics)
+            else:
+                logger.warning("Dynamics training enabled but model not initialized. Skipping.")
+        else:
+            logger.info("Dynamics model training is disabled by configuration.")
+
+        if self.config.get("training", {}).get("train_reward", True):
+            if self.reward_model:
+                logger.info("--- Training Reward Model ---")
+                reward_metrics = self.train_reward()
+                all_metrics.update(reward_metrics)
+            else:
+                logger.warning("Reward training enabled but model not initialized. Skipping.")
+        else:
+            logger.info("Reward model training is disabled by configuration.")
+
+        logger.info("PLDM training process finished.")
+
+        # Optionally evaluate final models on test set here if needed
+
+        return all_metrics
+
+
+    def validate_dynamics(self):
+        """
+        Validate the dynamics model on the validation set.
+        
+        Returns:
+            Average validation loss (float).
+        """
+        if self.dynamics_model is None or self.val_loader is None:
+            logger.warning("Cannot validate dynamics: Model or validation loader not initialized.")
+            return float('inf')
+
+        self.dynamics_model.eval()
+        # Also set CNN encoder to eval mode if it exists
+        if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None:
+            self.cnn_encoder.eval()
+
         total_loss = 0
         total_batches = 0
-        
-        # Use tqdm for progress bar
-        data_iterator = tqdm(data_loader, desc=f"Epoch {epoch+1} Validate", leave=False, unit="batch")
-        
+        criterion = MSELoss() # Use simple MSE for validation reporting consistency
+
         with torch.no_grad():
-            for batch_idx, (state, action, next_state, reward) in enumerate(data_iterator):
+            val_iterator = tqdm(self.val_loader, desc="Validating Dynamics", leave=False)
+            for batch in val_iterator:
+                state, action, next_state, _ = batch
                 state = state.to(self.device)
                 action = action.to(self.device)
-                
-                if is_dynamics:
-                    target = next_state.to(self.device)
-                    output = model(state, action)
-                    if output.shape != target.shape:
-                         output = torch.nn.functional.interpolate(output, size=target.shape[2:], mode='nearest')
+                next_state = next_state.to(self.device)
+
+                # Handle state encoding
+                if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None and self.model_type == 'grid':
+                    state_repr = self.cnn_encoder(state)
+                    next_state_repr = self.cnn_encoder(next_state)
                 else:
-                    reward = reward.to(self.device)
-                    target = reward.unsqueeze(1) if reward.dim() == 1 else reward
-                    output = model(state, action)
-                    if output.dim() == 1: output = output.unsqueeze(1)
-                    if output.shape != target.shape:
-                         logger.warning(f"Reward output shape {output.shape} mismatch target {target.shape} in validation batch {batch_idx}.")
-                         try:
-                             target = target.view_as(output)
-                         except RuntimeError:
-                             logger.error("Validation: Could not reshape reward target. Skipping batch.")
-                             continue
-                
-                try:
-                    # Use the new loss function interface
-                    loss_info = criterion(output, target)
-                    loss = loss_info.total_loss
-                    
-                    total_loss += loss.item()
-                    total_batches += 1
-                    data_iterator.set_postfix(loss=f"{loss.item():.6f}")
-                except Exception as loss_err:
-                    logger.error(f"Error computing validation loss for batch {batch_idx}: {loss_err}")
-                    continue
+                    state_repr = state
+                    next_state_repr = next_state
 
-        data_iterator.close()
-        avg_loss = total_loss / total_batches if total_batches > 0 else 0.0
-        logger.debug(f"Epoch {epoch+1} Average Validation Loss: {avg_loss:.6f}")
+                # Get prediction
+                # Handle different model signatures (e.g., teacher forcing off during eval)
+                if isinstance(self.dynamics_model, TransformerPredictor):
+                     # No target_seq or teacher forcing during validation
+                     pred_next_state_repr = self.dynamics_model(state_repr, action, teacher_forcing_ratio=0.0)
+                else:
+                     pred_next_state_repr = self.dynamics_model(state_repr, action)
+
+                # Calculate loss (MSE between predicted and actual next state representation)
+                loss_info = criterion(pred_next_state_repr, next_state_repr)
+                loss = loss_info.total_loss
+
+                total_loss += loss.item()
+                total_batches += 1
+
+        avg_loss = total_loss / total_batches if total_batches > 0 else float('inf')
         return avg_loss
-    
-    def save_model(self, model, model_name: str):
-        """
-        Save a model state dict and potentially log to WandB as an artifact.
-        
-        Args:
-            model: Model to save
-            model_name: Name of the model (e.g. 'dynamics', 'reward')
-        """
-        os.makedirs(self.output_dir, exist_ok=True)
-        model_path = self.output_dir / f"{model_name}_model.pt"
-        
-        try:
-            torch.save(model.state_dict(), model_path)
-            logger.info(f"Model saved to {model_path}")
 
-            # Log model artifact to WandB if enabled and artifacts are not disabled
-            if self.use_wandb and not self.disable_artifacts:
-                 try:
-                     artifact_name = f"{model_name}_model"
-                     artifact = wandb.Artifact(artifact_name, type='model')
-                     artifact.add_file(str(model_path))
-                     self.wandb_run.log_artifact(artifact)
-                     logger.info(f"Logged {model_name} model artifact to WandB.")
-                 except Exception as wb_err:
-                     logger.error(f"Failed to log model artifact to WandB: {wb_err}")
-            elif self.use_wandb and self.disable_artifacts:
-                logger.info(f"WandB artifact logging disabled. Model saved locally only.")
-        except Exception as e:
-            logger.error(f"Failed to save model {model_name} to {model_path}: {e}")
-    
-    def load_model(self, model_name: str):
+
+    def validate_reward(self):
         """
-        Load a saved model state dict.
-        
-        Args:
-            model_name: Name of the model to load ('dynamics' or 'reward')
-        """
-        model_path = self.output_dir / f"{model_name}_model.pt"
-        
-        if not os.path.exists(model_path):
-            logger.error(f"Model file not found at {model_path}")
-            raise FileNotFoundError(f"Model file not found at {model_path}")
-        
-        target_model = None
-        if model_name == 'dynamics':
-            if self.dynamics_model is None:
-                 logger.error("Dynamics model not initialized before loading.")
-                 raise ValueError("Dynamics model not initialized.")
-            target_model = self.dynamics_model
-        elif model_name == 'reward':
-            if self.reward_model is None:
-                 logger.error("Reward model not initialized before loading.")
-                 raise ValueError("Reward model not initialized.")
-            target_model = self.reward_model
-        else:
-            logger.error(f"Unknown model name for loading: {model_name}")
-            raise ValueError(f"Unknown model name: {model_name}")
-            
-        try:
-            # Use the custom loader if model has dynamic layers (Grid models)
-            if isinstance(target_model, (GridDynamicsPredictor, GridRewardPredictor)):
-                 from solution.test_pldm import load_model_with_dynamic_layers # Avoid circular import if possible
-                 load_model_with_dynamic_layers(target_model, model_path, self.device)
-            else:
-                 # Standard loading for vector models or others
-                 target_model.load_state_dict(torch.load(model_path, map_location=self.device))
-            logger.info(f"Loaded {model_name} model from {model_path}")
-        except Exception as e:
-             logger.error(f"Error loading model state dict for {model_name} from {model_path}: {e}")
-             raise # Re-raise the exception after logging
-    
-    def evaluate_test_set(self, model_type='both'):
-        """
-        Evaluate models on the test set.
-        
-        Args:
-            model_type: Which model to evaluate ('dynamics', 'reward', or 'both')
+        Validate the reward model on the validation set.
         
         Returns:
-            Dictionary of test metrics
+            Average validation loss (float).
         """
-        if self.test_loader is None:
-            logger.error("Cannot evaluate: Test loader not initialized")
-            return {}
+        if self.reward_model is None or self.val_loader is None:
+            logger.warning("Cannot validate reward: Model or validation loader not initialized.")
+            return float('inf')
 
-        test_metrics = {}
-        
-        if model_type in ['dynamics', 'both']:
-            if self.dynamics_model is None:
-                logger.error("Cannot evaluate dynamics: Model not initialized")
-            else:
-                dynamics_loss = self._validate(
-                    model=self.dynamics_model,
-                    criterion=self.dynamics_criterion,
-                    data_loader=self.test_loader,
-                    is_dynamics=True,
-                    epoch=-1  # -1 indicates test set evaluation
-                )
-                test_metrics['dynamics_test_loss'] = dynamics_loss
-                logger.info(f"Dynamics Test Loss: {dynamics_loss:.6f}")
-                
-                # Log to WandB if enabled
-                if self.use_wandb:
-                    wandb.log({"dynamics_test_loss": dynamics_loss})
-        
-        if model_type in ['reward', 'both']:
-            if self.reward_model is None:
-                logger.error("Cannot evaluate reward: Model not initialized")
-            else:
-                reward_loss = self._validate(
-                    model=self.reward_model,
-                    criterion=self.reward_criterion,
-                    data_loader=self.test_loader,
-                    is_dynamics=False,
-                    epoch=-1  # -1 indicates test set evaluation
-                )
-                test_metrics['reward_test_loss'] = reward_loss
-                logger.info(f"Reward Test Loss: {reward_loss:.6f}")
-                
-                # Log to WandB if enabled
-                if self.use_wandb:
-                    wandb.log({"reward_test_loss": reward_loss})
-        
-        return test_metrics
-    
-    def train_all(self, dynamics_epochs: int = 10, reward_epochs: int = 10, log_interval: int = 10):
+        self.reward_model.eval()
+        # CNN encoder is usually frozen during reward validation/training
+        if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None:
+            self.cnn_encoder.eval() # Keep in eval mode
+
+        total_loss = 0
+        total_batches = 0
+        criterion = MSELoss() # Use simple MSE for validation reporting
+
+        with torch.no_grad():
+            val_iterator = tqdm(self.val_loader, desc="Validating Reward", leave=False)
+            for batch in val_iterator:
+                state, action, _, reward = batch
+                state = state.to(self.device)
+                action = action.to(self.device)
+                reward = reward.to(self.device).float().unsqueeze(1) # Target shape [batch_size, 1]
+
+                # Handle state encoding
+                if hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None and self.model_type == 'grid':
+                    state_repr = self.cnn_encoder(state)
+                else:
+                    state_repr = state
+
+                # Get prediction
+                pred_reward = self.reward_model(state_repr, action)
+
+                # Calculate loss (MSE between predicted and actual reward)
+                loss_info = criterion(pred_reward, reward)
+                loss = loss_info.total_loss
+
+                total_loss += loss.item()
+                total_batches += 1
+
+        avg_loss = total_loss / total_batches if total_batches > 0 else float('inf')
+        return avg_loss
+
+
+    def save_model(self, model_name):
         """
-        Train both dynamics and reward models.
+        Save model to disk. Saves both predictor and CNN encoder if used.
         
         Args:
-            dynamics_epochs: Number of epochs to train dynamics model
-            reward_epochs: Number of epochs to train reward model
-            log_interval: Interval for logging
+            model_name: Name of the model to save ('dynamics' or 'reward')
         """
-        # Check training flags from config
-        config_train_dynamics = self.config.get("training", {}).get("train_dynamics", True)
-        config_train_reward = self.config.get("training", {}).get("train_reward", True)
-        
-        logger.info("Starting model training phase.")
-        logger.info(f"Training dynamics model: {'ENABLED' if config_train_dynamics else 'DISABLED'}")
-        logger.info(f"Training reward model: {'ENABLED' if config_train_reward else 'DISABLED'}")
-        
-        # Train dynamics model if enabled
-        if config_train_dynamics:
-            self.train_dynamics(num_epochs=dynamics_epochs, log_interval=log_interval)
+        model_to_save = None
+        optimizer_to_save = None
+        if model_name == 'dynamics':
+            model_to_save = self.dynamics_model
+            optimizer_to_save = self.dynamics_optimizer
+        elif model_name == 'reward':
+            model_to_save = self.reward_model
+            optimizer_to_save = self.reward_optimizer
         else:
-            logger.info("Skipping dynamics model training as per configuration.")
-            
-        # Train reward model if enabled
-        if config_train_reward:
-            self.train_reward(num_epochs=reward_epochs, log_interval=log_interval)
+            logger.error(f"Unknown model name for saving: {model_name}")
+            return
+
+        if model_to_save is None:
+            logger.error(f"Cannot save {model_name} model: Model not initialized")
+            return
+
+        # Create output directory if it doesn't exist
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # --- Save Predictor Model ---
+        predictor_path = os.path.join(self.output_dir, f"{model_name}_model.pt")
+        predictor_state = {
+            'model_state_dict': model_to_save.state_dict(),
+            'config': self.config, # Save the full config used for training
+            # Optionally save optimizer state if needed for resuming training
+             'optimizer_state_dict': optimizer_to_save.state_dict() if optimizer_to_save else None,
+        }
+        try:
+            torch.save(predictor_state, predictor_path)
+            logger.info(f"Saved {model_name} predictor model to {predictor_path}")
+            # Log artifact to WandB if enabled
+            if self.wandb_run and self.config.get("wandb", {}).get("save_model", True):
+                 artifact = wandb.Artifact(f'{model_name}-predictor', type='model')
+                 artifact.add_file(predictor_path)
+                 self.wandb_run.log_artifact(artifact)
+                 logger.info(f"Logged {model_name} predictor artifact to WandB")
+
+        except Exception as e:
+            logger.error(f"Error saving {model_name} predictor model: {e}", exc_info=True)
+
+
+        # --- Save CNN Encoder (if exists and associated with this model type) ---
+        # Conventionally, CNN encoder is trained/saved with dynamics model
+        if model_name == 'dynamics' and hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None:
+            cnn_encoder_path = os.path.join(self.output_dir, "cnn_encoder.pt")
+            cnn_encoder_state = {
+                'model_state_dict': self.cnn_encoder.state_dict(),
+                'config': self.config, # Save config as well
+                 # Optimizer state for CNN params is within dynamics_optimizer, saved above
+            }
+            try:
+                torch.save(cnn_encoder_state, cnn_encoder_path)
+                logger.info(f"Saved CNN encoder model to {cnn_encoder_path}")
+                # Log artifact to WandB
+                if self.wandb_run and self.config.get("wandb", {}).get("save_model", True):
+                     artifact = wandb.Artifact('cnn-encoder', type='model')
+                     artifact.add_file(cnn_encoder_path)
+                     self.wandb_run.log_artifact(artifact)
+                     logger.info("Logged CNN encoder artifact to WandB")
+            except Exception as e:
+                logger.error(f"Error saving CNN encoder model: {e}", exc_info=True)
+
+
+    def load_model(self, model_name, model_path=None, cnn_encoder_path=None):
+        """
+        Load model from disk. Loads both predictor and CNN encoder if paths provided.
+        
+        Args:
+            model_name: Name of the model to load ('dynamics' or 'reward').
+            model_path: Path to the predictor model file (.pt). Defaults to standard path in output_dir.
+            cnn_encoder_path: Path to the CNN encoder file (.pt). Defaults to standard path. Required if model uses CNN.
+        """
+        # Determine default paths if not provided
+        if model_path is None:
+            model_path = os.path.join(self.output_dir, f"{model_name}_model.pt")
+        if cnn_encoder_path is None and model_name == 'dynamics': # Only default load CNN for dynamics
+             cnn_encoder_path = os.path.join(self.output_dir, "cnn_encoder.pt")
+
+        # --- Load Predictor Model ---
+        if os.path.exists(model_path):
+            try:
+                checkpoint = torch.load(model_path, map_location=self.device)
+                # Re-initialize model based on saved config if necessary?
+                # For now, assume the model structure matches when loading state_dict
+                if model_name == 'dynamics' and self.dynamics_model:
+                    self.dynamics_model.load_state_dict(checkpoint['model_state_dict'])
+                    # Load optimizer state if available and needed
+                    if 'optimizer_state_dict' in checkpoint and self.dynamics_optimizer:
+                         self.dynamics_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    logger.info(f"Loaded {model_name} predictor model from {model_path}")
+                elif model_name == 'reward' and self.reward_model:
+                    self.reward_model.load_state_dict(checkpoint['model_state_dict'])
+                    if 'optimizer_state_dict' in checkpoint and self.reward_optimizer:
+                         self.reward_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    logger.info(f"Loaded {model_name} predictor model from {model_path}")
+                else:
+                    logger.warning(f"{model_name.capitalize()} model not initialized, cannot load state dict from {model_path}")
+
+            except FileNotFoundError:
+                logger.error(f"Predictor model file not found at {model_path}. Cannot load {model_name} model.")
+            except Exception as e:
+                logger.error(f"Error loading {model_name} predictor model from {model_path}: {e}", exc_info=True)
         else:
-            logger.info("Skipping reward model training as per configuration.")
-        
-        # Evaluate on test set after training
-        dynamics_trained = config_train_dynamics
-        reward_trained = config_train_reward
-        
-        if dynamics_trained or reward_trained:
-            logger.info("Evaluating final models on test set...")
-            if dynamics_trained and reward_trained:
-                model_type = 'both'
-            elif dynamics_trained:
-                model_type = 'dynamics'
+             logger.warning(f"Predictor model file {model_path} does not exist. Model not loaded.")
+
+
+        # --- Load CNN Encoder ---
+        # Only load if cnn_encoder exists on the trainer AND path is valid AND it's for dynamics
+        if model_name == 'dynamics' and hasattr(self, 'cnn_encoder') and self.cnn_encoder is not None:
+            if cnn_encoder_path and os.path.exists(cnn_encoder_path):
+                try:
+                    cnn_checkpoint = torch.load(cnn_encoder_path, map_location=self.device)
+                    self.cnn_encoder.load_state_dict(cnn_checkpoint['model_state_dict'])
+                    logger.info(f"Loaded CNN encoder from {cnn_encoder_path}")
+                    # Note: CNN optimizer state is part of dynamics_optimizer state, loaded above.
+                except FileNotFoundError:
+                     logger.error(f"CNN encoder file not found at {cnn_encoder_path}. Cannot load.")
+                except Exception as e:
+                    logger.error(f"Error loading CNN encoder model from {cnn_encoder_path}: {e}", exc_info=True)
             else:
-                model_type = 'reward'
-            
-            test_metrics = self.evaluate_test_set(model_type=model_type)
-        
-        logger.info("Training phase complete.") 
+                 logger.warning(f"CNN encoder path {cnn_encoder_path} not found or not specified. CNN encoder not loaded.")
+
+
+# Example usage (within another script like train_pldm.py)
+if __name__ == '__main__':
+    # This is placeholder example code
+    logging.basicConfig(level=logging.INFO)
+    logger.info("PLDM Trainer module direct execution (example usage)")
+
+    # Dummy config
+    dummy_config = {
+        "seed": 42,
+        "model": {"type": "grid", "encoder_type": "cnn", "state_embed_dim": 64,
+                  "dynamics_predictor": {"predictor_type": "transformer"},
+                  "reward_predictor": {"predictor_type": "grid"}
+                  },
+        "data": {"train_data_path": "dummy_train.csv", "grid_size": 5},
+        "training": {"batch_size": 4, "dynamics_epochs": 1, "reward_epochs": 1,
+                     "train_dynamics": True, "train_reward": True},
+        "loss": {"dynamics_loss": "mse", "reward_loss": "mse"},
+        "wandb": {"use_wandb": False}
+    }
+
+    # Need dummy data loaders for initialization
+    # Replace with actual data loading
+    class DummyDataset(torch.utils.data.Dataset):
+        def __len__(self): return 16
+        def __getitem__(self, idx):
+            # B, C, H, W
+            state = torch.randn(32, 5, 5)
+            action = torch.randint(0, 6, (1,)).squeeze() # scalar action
+            next_state = torch.randn(32, 5, 5)
+            reward = torch.randn(1).squeeze()
+            return state, action, next_state, reward
+
+    dummy_loader = DataLoader(DummyDataset(), batch_size=4)
+
+    try:
+        trainer = PLDMTrainer(
+            config=dummy_config,
+            output_dir="temp_pldm_output",
+            train_loader=dummy_loader, # Provide dummy loaders
+            val_loader=dummy_loader
+        )
+        logger.info("Dummy Trainer initialized.")
+        # trainer.train_all() # Run training
+        # trainer.save_model('dynamics')
+        # trainer.save_model('reward')
+        # trainer.load_model('dynamics')
+        logger.info("Dummy run completed.")
+
+    except Exception as e:
+        logger.error(f"Error during dummy trainer execution: {e}", exc_info=True)
+
+    # Clean up dummy files/dirs if needed
+    # import shutil
+    # if os.path.exists("temp_pldm_output"):
+    #     shutil.rmtree("temp_pldm_output") 

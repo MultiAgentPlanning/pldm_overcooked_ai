@@ -814,11 +814,7 @@ def main():
         if run_training:
             logger.info("\n=== PHASE 1: TRAINING ===")
             logger.info("Starting model training...")
-            trainer.train_all(
-                dynamics_epochs=config["training"]["dynamics_epochs"],
-                reward_epochs=config["training"]["reward_epochs"],
-                log_interval=config["training"]["log_interval"]
-            )
+            trainer.train_all()
             logger.info(f"Training complete. Models saved to {config['training']['output_dir']}")
             
             # Free up memory after training

@@ -22,7 +22,9 @@ data:
 # Model parameters
 model:
   type: "grid"
-  encoder_type: "cnn"
+  encoder_type: "cnn"  # Options: "cnn", "basic", etc.
+  # CNN encoder params
+  state_embed_dim: 128
   # grid encoder params
   grid_dims:
     H: 5
@@ -97,7 +99,7 @@ loss:
 # Training parameters
 training:
   batch_size: 128
-  dynamics_epochs: 100
+  dynamics_epochs: 1
   reward_epochs: 1
   learning_rate: 0.001
   optimizer: "adam"

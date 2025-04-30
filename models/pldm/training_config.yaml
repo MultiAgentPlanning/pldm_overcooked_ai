@@ -89,7 +89,7 @@ loss:
 training:
   output_dir: models/pldm
   batch_size: 128
-  dynamics_epochs: 100
+  dynamics_epochs: 1
   reward_epochs: 1
   learning_rate: 0.001
   log_interval: 10
