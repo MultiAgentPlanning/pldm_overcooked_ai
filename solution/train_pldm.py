@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, Optional
 import torch.nn as nn
+import gc  # Import garbage collection
 
 os.environ['WANDB_IGNORE_GLOBS'] = '*.pem'
 os.environ['CURL_CA_BUNDLE'] = ''
@@ -31,7 +32,7 @@ from solution.pldm.data_processor import OvercookedDataset
 from solution.pldm import Planner
 from solution.pldm.utils import parse_state
 from solution.pldm.prober import Prober, GridProber, VectorProber
-from solution.probe_pldm import ProberEvaluator, ProbeTarget
+from solution.probe_pldm import ProbingEvaluator, ProbingConfig, StateChannels
 
 # Get a logger for this module
 logger = logging.getLogger(__name__)
@@ -322,7 +323,7 @@ def evaluate_planner(config, model_dir, device, wandb_run=None, print_arch=False
 
 def run_probing(config, model_dir, device, wandb_run=None, print_arch=False):
     """
-    Run probing analysis on trained models to evaluate their representations.
+    Run probing analysis on trained models to evaluate their state channel representations.
     
     Args:
         config: The configuration dictionary
@@ -334,7 +335,7 @@ def run_probing(config, model_dir, device, wandb_run=None, print_arch=False):
     Returns:
         Dictionary containing probing metrics
     """
-    logger.info("Starting representation probing analysis...")
+    logger.info("Starting state channel representation probing analysis...")
     
     # Check if probing configuration exists
     if "probing" not in config:
@@ -349,31 +350,57 @@ def run_probing(config, model_dir, device, wandb_run=None, print_arch=False):
     logger.info(f"Setting probing seed to {seed} for reproducibility")
     set_seeds(seed)  # This will set seeds for random, numpy, and torch
     
-    # Check if any targets are specified
-    targets = probing_config.get("targets", [])
-    if not targets:
-        logger.warning("No probing targets specified. Skipping probing.")
-        return {}
-    
     # Create probing output directory 
-    probing_dir = Path(model_dir) / "probing"
+    probing_dir = Path(model_dir) / "channel_probing"
     os.makedirs(probing_dir, exist_ok=True)
     
+    # Get the models to probe based on config
+    probe_dynamics = probing_config.get("probe_dynamics", True)
+    probe_reward = probing_config.get("probe_reward", True)
+    probe_encoder = probing_config.get("probe_encoder", True)
+    probe_predictor = probing_config.get("probe_predictor", False)
+    
+    if not probe_dynamics and not probe_reward:
+        logger.warning("Neither dynamics nor reward model selected for probing. Skipping.")
+        return {}
+    
+    # Create ProbingConfig instance
+    probe_config = ProbingConfig(
+        lr=probing_config.get("lr", 1e-3),
+        epochs=probing_config.get("epochs", 30),
+        batch_size=probing_config.get("batch_size", 64),
+        seed=seed,
+        probe_dynamics=probe_dynamics,
+        probe_reward=probe_reward,
+        probe_encoder=probe_encoder,
+        probe_predictor=probe_predictor,
+        visualize=probing_config.get("visualize", True),
+        save_weights=probing_config.get("save_weights", True),
+        save_visualizations=probing_config.get("save_visualizations", True),
+        max_vis_samples=probing_config.get("max_vis_samples", 5),
+        use_wandb=wandb_run is not None
+    )
+    
     # Log probing configuration for reproducibility
-    logger.info(f"Probing configuration: batch_size={probing_config.get('batch_size', 64)}, "
-                f"epochs={probing_config.get('epochs', 10)}, seed={seed}")
+    logger.info(f"Probing configuration: batch_size={probe_config.batch_size}, "
+                f"epochs={probe_config.epochs}, seed={seed}")
     
     # Load the saved models using PLDMTrainer
     try:
+        # Set a smaller batch size for probing to reduce memory usage
+        probing_batch_size = min(probe_config.batch_size, 32)  # Use a smaller batch size if configured one is large
+        logger.info(f"Using batch size {probing_batch_size} for probing to manage memory usage")
+        
         # Initialize trainer with the saved models
         trainer = PLDMTrainer(
             data_path=config["data"]["train_data_path"],
             output_dir=model_dir,
             model_type=config["model"]["type"],
-            batch_size=probing_config.get("batch_size", 32),
+            batch_size=probing_batch_size,
             device=device,
             wandb_run=wandb_run,
-            seed=seed  # Explicitly pass seed to ensure data loaders are consistent
+            seed=seed,  # Explicitly pass seed to ensure data loaders are consistent
+            config=config  # Pass the full config
         )
         
         # Load saved models
@@ -383,102 +410,83 @@ def run_probing(config, model_dir, device, wandb_run=None, print_arch=False):
         logger.info("PLDM models loaded successfully for probing")
     except Exception as e:
         logger.error(f"Error loading models for probing: {e}")
-        return {}
-    
-    # Ensure probing_config has all necessary parameters for ProberEvaluator
-    # Map parameters from config to what ProberEvaluator expects
-    probing_params = {
-        "batch_size": probing_config.get("batch_size", 64),
-        "lr": probing_config.get("lr", 0.001),
-        "epochs": probing_config.get("epochs", 10),
-        "model_type": config["model"]["type"],
-        "data_path": config["data"]["train_data_path"],
-        "max_samples": config["data"].get("max_samples"),
-        "visualize": probing_config.get("visualize", True),
-        "max_vis_samples": probing_config.get("max_vis_samples", 10),
-        "num_workers": config["training"].get("num_workers", 4),
-        "seed": seed  # Ensure seed is explicitly set in params
-    }
-    
-    # Get the models to probe based on config
-    probe_dynamics = probing_config.get("probe_dynamics", True)
-    probe_reward = probing_config.get("probe_reward", True)
-    
-    if not probe_dynamics and not probe_reward:
-        logger.warning("Neither dynamics nor reward model selected for probing. Skipping.")
+        logger.exception("Probing exception details:")
         return {}
     
     # Initialize prober evaluator
-    prober_evaluator = ProberEvaluator(
-        pldm_trainer=trainer,
+    prober_evaluator = ProbingEvaluator(
+        model=trainer,
         output_dir=str(probing_dir),
-        config=probing_params,
+        config=probe_config,
         device=device,
         wandb_run=wandb_run
     )
     
     # Save probing configuration for reproducibility
-    probing_config_path = probing_dir / "probing_config.json"
+    probing_config_path = probing_dir / "probe_config.json"
     with open(probing_config_path, 'w') as f:
         json.dump({
             'seed': seed,
-            'probing_params': probing_params,
-            'targets': targets,
-            'probe_dynamics': probe_dynamics,
-            'probe_reward': probe_reward
+            'batch_size': probe_config.batch_size,
+            'epochs': probe_config.epochs,
+            'lr': probe_config.lr,
+            'probe_dynamics': probe_config.probe_dynamics,
+            'probe_reward': probe_config.probe_reward,
+            'probe_encoder': probe_config.probe_encoder,
+            'probe_predictor': probe_config.probe_predictor,
+            'visualize': probe_config.visualize,
+            'model_type': config["model"]["type"]
         }, f, indent=2)
     logger.info(f"Saved probing configuration to {probing_config_path}")
     
     # Train and evaluate probers
     try:
-        logger.info(f"Training and evaluating probing dynamics_agent_pos with {probing_params['epochs']} epochs...")
+        logger.info(f"Training and evaluating state channel probers with {probe_config.epochs} epochs...")
         
-        # Filter the models to probe based on config
-        results = {}
+        # List the channels being probed
+        channel_names = StateChannels.get_channel_names()
+        logger.info(f"Probing {len(channel_names)} state channels: {', '.join(channel_names[:5])}...")
         
-        # Only probe dynamics model
-        models_to_probe = ['dynamics']
-        logger.info(f"Models to probe: {models_to_probe}")
+        # Train and evaluate all probers
+        results = prober_evaluator.train_probers_for_all_channels()
         
-        # Only train dynamics_agent_pos prober
-        model_type = 'dynamics'
-        target = ProbeTarget.AGENT_POS
-        
-        logger.info(f"Probing {model_type} model for {target}")
-        try:
-            # Set seed for reproducibility
-            set_seeds(seed)
-            
-            # Train and evaluate the prober
-            prober = prober_evaluator.train_prober(target, model_type)
-            
-            # Print prober architecture if requested
-            if print_arch:
-                print_model_architecture(prober, f"PROBER ({model_type}_{target})")
-                
-            metrics = prober_evaluator.evaluate_prober(prober, target, model_type)
-            results[(model_type, target)] = metrics
-        except Exception as e:
-            logger.error(f"Error probing {model_type} for {target}: {e}")
-        
-        # Aggregate results
-        if results:
-            prober_evaluator.aggregate_results(results)
-        
-        # Return a summary of the probing results
-        summary_metrics = {}
+        # Print prober architecture if requested
+        if print_arch and results:
+            # Get a sample prober
+            sample_prober_key = list(prober_evaluator.probers.keys())[0]
+            sample_prober = prober_evaluator.probers[sample_prober_key]
+            print_model_architecture(sample_prober, f"CHANNEL PROBER ARCHITECTURE")
         
         # Extract key metrics from results for overall summary
-        for (model_type, target), metrics in results.items():
-            key = f"probe_{model_type}_{target}"
-            for metric_name, value in metrics.items():
-                summary_metrics[f"{key}_{metric_name}"] = value
+        summary_metrics = {}
+        for key, metrics in results.items():
+            model_type, repr_type, channel_name = key
+            summary_key = f"probe_{model_type}_{repr_type}_{channel_name}"
+            
+            # Include the main metrics
+            summary_metrics[f"{summary_key}_mean_loss"] = metrics.get('mean_loss', 0)
+            summary_metrics[f"{summary_key}_rmse"] = metrics.get('rmse', 0) 
+            summary_metrics[f"{summary_key}_r2_score"] = metrics.get('r2_score', 0)
+        
+        # Clean up memory
+        logger.info("Cleaning up memory after probing...")
+        # Remove large objects
+        prober_evaluator = None
+        trainer = None
+        # Force garbage collection
+        gc.collect()
+        torch.cuda.empty_cache()
         
         return summary_metrics
         
     except Exception as e:
         logger.error(f"Error during probing: {e}")
         logger.exception("Probing exception details:")
+        # Clean up even on error
+        trainer = None
+        prober_evaluator = None
+        gc.collect()
+        torch.cuda.empty_cache()
         return {}
 
 def main():
@@ -545,6 +553,28 @@ def main():
                         help="Comma-separated list of probing targets (e.g., 'state,reward,agent_pos')")
     parser.add_argument("--probing_epochs", type=int, default=None,
                         help="Number of epochs for probing (overrides config)")
+    parser.add_argument("--save_prober_weights", action="store_true", dest="save_prober_weights", default=True,
+                        help="Save prober model weights to disk")
+    parser.add_argument("--no_save_prober_weights", action="store_false", dest="save_prober_weights",
+                        help="Skip saving prober model weights (saves disk space)")
+    parser.add_argument("--save_visualizations", action="store_true", dest="save_visualizations", default=True,
+                        help="Save visualization images to disk")
+    parser.add_argument("--no_save_visualizations", action="store_false", dest="save_visualizations",
+                        help="Skip saving visualization images (saves disk space)")
+
+    # New command-line arguments
+    parser.add_argument("--dynamics_epochs", type=int, default=None,
+                        help="Number of epochs to train dynamics model (overrides config)")
+    parser.add_argument("--reward_epochs", type=int, default=None,
+                        help="Number of epochs to train reward model (overrides config)")
+    parser.add_argument("--train_dynamics", action="store_true", dest="train_dynamics", default=True,
+                        help="Train the dynamics model")
+    parser.add_argument("--no_train_dynamics", action="store_false", dest="train_dynamics",
+                        help="Skip training the dynamics model")
+    parser.add_argument("--train_reward", action="store_true", dest="train_reward", default=True,
+                        help="Train the reward model")
+    parser.add_argument("--no_train_reward", action="store_false", dest="train_reward",
+                        help="Skip training the reward model")
     
     args = parser.parse_args()
     
@@ -599,6 +629,20 @@ def main():
         override_config.setdefault("probing", {})["targets"] = args.probing_targets.split(',')
     if args.probing_epochs is not None:
         override_config.setdefault("probing", {})["epochs"] = args.probing_epochs
+    if args.save_prober_weights is not None:
+        override_config.setdefault("probing", {})["save_weights"] = args.save_prober_weights
+    if args.save_visualizations is not None:
+        override_config.setdefault("probing", {})["save_visualizations"] = args.save_visualizations
+    
+    # Override training settings if provided
+    if args.dynamics_epochs is not None:
+        override_config.setdefault("training", {})["dynamics_epochs"] = args.dynamics_epochs
+    if args.reward_epochs is not None:
+        override_config.setdefault("training", {})["reward_epochs"] = args.reward_epochs
+    if args.train_dynamics is not None:
+        override_config.setdefault("training", {})["train_dynamics"] = args.train_dynamics
+    if args.train_reward is not None:
+        override_config.setdefault("training", {})["train_reward"] = args.train_reward
     
     # Override workflow settings if command-line flags were used
     # Handle workflow settings, prioritizing the new flags over legacy ones
@@ -770,12 +814,19 @@ def main():
         if run_training:
             logger.info("\n=== PHASE 1: TRAINING ===")
             logger.info("Starting model training...")
-            trainer.train_all(
-                dynamics_epochs=config["training"]["dynamics_epochs"],
-                reward_epochs=config["training"]["reward_epochs"],
-                log_interval=config["training"]["log_interval"]
-            )
+            trainer.train_all()
             logger.info(f"Training complete. Models saved to {config['training']['output_dir']}")
+            
+            # Free up memory after training
+            if hasattr(trainer, 'train_loader'):
+                logger.info("Freeing up training data to reduce memory usage...")
+                # Clear data loaders
+                trainer.train_loader = None
+                # Force garbage collection
+                gc.collect()
+                torch.cuda.empty_cache()
+                logger.info("Memory cleanup completed")
+                
         elif trainer and not run_training:
             # If trainer is initialized but training is skipped, we need to load the models
             try:
@@ -791,6 +842,17 @@ def main():
         if should_run_probing:
             logger.info("\n=== PHASE 2: PROBING ===")
             logger.info("Running representation probing...")
+            
+            # Free the main trainer object if possible before creating a new one for probing
+            if trainer and run_training:
+                logger.info("Releasing main trainer to free memory before probing...")
+                # Only keep the models, clear everything else
+                dynamics_model = trainer.dynamics_model
+                reward_model = trainer.reward_model
+                trainer = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                
             probing_metrics = run_probing(
                 config=config,
                 model_dir=config["training"]["output_dir"],

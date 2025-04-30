@@ -210,6 +210,7 @@ class TransformerPredictor(BasePredictor):
     
     This predictor uses transformer layers to process states and actions.
     Supports teacher forcing during training for improved stability.
+    Compatible with both grid-based and vector-based state encoders.
     """
     
     def __init__(
@@ -256,6 +257,9 @@ class TransformerPredictor(BasePredictor):
         # Project input to transformer dimension
         self.input_proj = nn.Linear(input_dim, hidden_size)
         
+        # Separate projection for action embeddings
+        self.action_proj = nn.Linear(action_embed_dim, hidden_size)
+        
         # Transformer encoder
         encoder_layers = nn.TransformerEncoderLayer(
             d_model=hidden_size, 
@@ -282,9 +286,12 @@ class TransformerPredictor(BasePredictor):
         Forward pass to predict the next state or reward.
         
         Args:
-            state: The current state representation
+            state: The current state representation - can be either:
+                  - Grid state: [batch_size, channels, height, width]
+                  - Vector state: [batch_size, input_dim]
+                  - Embedding from CNN: [batch_size, state_embed_dim]
             action_indices: Tensor of shape [batch_size, 2] with action indices for both agents
-            return_embedding: If True, returns the state embedding
+            return_embedding: If True, returns the state embedding instead of grid reconstruction
             target_state: Optional ground truth next state for teacher forcing
             use_teacher_forcing: Whether to use teacher forcing (if None, uses self.teacher_forcing_ratio)
             
@@ -293,9 +300,18 @@ class TransformerPredictor(BasePredictor):
         """
         batch_size = state.shape[0]
         
-        # If only the embedding is requested, return it
-        if return_embedding:
-            return state
+        # Handle different input state formats
+        is_grid_input = len(state.shape) > 2
+        
+        # Store original dimensions for reshaping the output later if grid input
+        if is_grid_input:
+            self.original_shape = state.shape
+            # Flatten the grid dimensions
+            state = state.view(batch_size, -1)
+            
+            # Also flatten target_state if provided and has more than 2 dimensions
+            if target_state is not None and len(target_state.shape) > 2:
+                target_state = target_state.view(batch_size, -1)
         
         # Project state to transformer dimension
         state_embed = self.input_proj(state)
@@ -304,8 +320,8 @@ class TransformerPredictor(BasePredictor):
         action_embeds = []
         for i in range(action_indices.shape[1]):  # For each agent
             action_embed = self.action_embedding(action_indices[:, i])
-            # Project to transformer dimension
-            action_embed = self.input_proj(action_embed)
+            # Project to transformer dimension using action projection
+            action_embed = self.action_proj(action_embed)
             action_embeds.append(action_embed)
         
         # Determine if we should use teacher forcing
@@ -336,8 +352,18 @@ class TransformerPredictor(BasePredictor):
             # Return scalar reward
             return self.output_proj(final_output)
         else:
-            # For dynamics, return embedding
-            return self.output_proj(final_output)
+            # For dynamics, get the output
+            output = self.output_proj(final_output)
+            
+            # Return embedding directly if requested
+            if return_embedding:
+                return output
+            
+            # Otherwise reshape back to grid form if the input was a grid
+            if is_grid_input and not return_embedding:
+                output = output.view(batch_size, *self.original_shape[1:])
+                
+            return output
 
 
 class LSTMPredictor(BasePredictor):
@@ -467,72 +493,175 @@ class LSTMPredictor(BasePredictor):
 
 def create_dynamics_predictor(config: Dict[str, Any], input_dim: int, output_dim: int):
     """
-    Create a dynamics predictor based on the configuration.
+    Create a dynamics predictor based on configuration.
     
     Args:
-        config: Configuration dictionary
+        config: Configuration dictionary with predictor settings
         input_dim: Input dimension for the predictor
         output_dim: Output dimension for the predictor
         
     Returns:
-        A dynamics predictor instance
+        Initialized dynamics predictor
     """
-    predictor_type = config.get("dynamics_predictor_type", "grid")
-    predictor_params = config.get("dynamics_predictor_params", {})
+    predictor_type = config.get("predictor_type", "grid").lower()
     
     # Common parameters
-    params = {
-        "input_dim": input_dim,
-        "output_dim": output_dim,
-        "num_actions": config.get("num_actions", 6),
-        "action_embed_dim": config.get("action_embed_dim", 4),
-        "is_reward": False,
-        **predictor_params
-    }
+    num_actions = config.get("num_actions", 6)
+    action_embed_dim = config.get("action_embed_dim", 4)
+    hidden_size = config.get("hidden_size", 128)
+    num_layers = config.get("num_layers", 2)
+    dropout = config.get("dropout", 0.1)
+    activation = config.get("activation", "relu")
+    is_reward = False
     
-    # Add grid-specific parameters if needed
-    if predictor_type.lower() == "grid" and "grid_params" in config:
-        grid_params = config.get("grid_params", {})
-        params.update({
-            "channels": grid_params.get("num_channels", 31),
-            "height": grid_params.get("grid_height", 5),
-            "width": grid_params.get("grid_width", 13)
-        })
+    # Check if we're using a CNN encoder
+    use_cnn_encoder = config.get("use_cnn_encoder", False)
     
-    return BasePredictor.create(predictor_type, **params)
+    if predictor_type == "transformer":
+        # Transformer parameters
+        num_heads = config.get("nhead", 4)
+        teacher_forcing_ratio = config.get("teacher_forcing_ratio", 0.5)
+        
+        return TransformerPredictor(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_actions=num_actions,
+            action_embed_dim=action_embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            is_reward=is_reward,
+            teacher_forcing_ratio=teacher_forcing_ratio
+        )
+    elif predictor_type == "lstm":
+        # LSTM parameters
+        bidirectional = config.get("bidirectional", False)
+        
+        return LSTMPredictor(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_actions=num_actions,
+            action_embed_dim=action_embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+            is_reward=is_reward
+        )
+    else:  # Default to grid predictor (or any basic predictor for CNN embedding)
+        # When using CNN encoder, we use grid predictor but with the input from CNN embedding
+        channels = None
+        height = None
+        width = None
+        
+        if not use_cnn_encoder:
+            # Only need these parameters for raw grid input
+            grid_dims = config.get("grid_dims", {})
+            channels = config.get("channels", 32)
+            height = grid_dims.get("H")
+            width = grid_dims.get("W")
+        
+        return GridPredictor(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_actions=num_actions,
+            action_embed_dim=action_embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            activation=activation,
+            channels=channels,
+            height=height,
+            width=width,
+            is_reward=is_reward
+        )
 
 
 def create_reward_predictor(config: Dict[str, Any], input_dim: int):
     """
-    Create a reward predictor based on the configuration.
+    Create a reward predictor based on configuration.
     
     Args:
-        config: Configuration dictionary
+        config: Configuration dictionary with predictor settings
         input_dim: Input dimension for the predictor
         
     Returns:
-        A reward predictor instance
+        Initialized reward predictor
     """
-    predictor_type = config.get("reward_predictor_type", "grid")
-    predictor_params = config.get("reward_predictor_params", {})
+    # Always output a scalar for reward
+    output_dim = 1
+    
+    predictor_type = config.get("predictor_type", "grid").lower()
     
     # Common parameters
-    params = {
-        "input_dim": input_dim,
-        "output_dim": 1,  # Reward is a scalar
-        "num_actions": config.get("num_actions", 6),
-        "action_embed_dim": config.get("action_embed_dim", 4),
-        "is_reward": True,
-        **predictor_params
-    }
+    num_actions = config.get("num_actions", 6)
+    action_embed_dim = config.get("action_embed_dim", 4)
+    hidden_size = config.get("hidden_size", 64)
+    num_layers = config.get("num_layers", 2)
+    dropout = config.get("dropout", 0.1)
+    activation = config.get("activation", "relu")
+    is_reward = True
     
-    # Add grid-specific parameters if needed
-    if predictor_type.lower() == "grid" and "grid_params" in config:
-        grid_params = config.get("grid_params", {})
-        params.update({
-            "channels": grid_params.get("num_channels", 31),
-            "height": grid_params.get("grid_height", 5),
-            "width": grid_params.get("grid_width", 13)
-        })
+    # Check if we're using a CNN encoder
+    use_cnn_encoder = config.get("use_cnn_encoder", False)
     
-    return BasePredictor.create(predictor_type, **params) 
+    if predictor_type == "transformer":
+        # Transformer parameters
+        num_heads = config.get("nhead", 4)
+        teacher_forcing_ratio = config.get("teacher_forcing_ratio", 0.5)
+        
+        return TransformerPredictor(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_actions=num_actions,
+            action_embed_dim=action_embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            is_reward=is_reward,
+            teacher_forcing_ratio=teacher_forcing_ratio
+        )
+    elif predictor_type == "lstm":
+        # LSTM parameters
+        bidirectional = config.get("bidirectional", False)
+        
+        return LSTMPredictor(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_actions=num_actions,
+            action_embed_dim=action_embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+            is_reward=is_reward
+        )
+    else:  # Default to grid predictor (or any basic predictor for CNN embedding)
+        # When using CNN encoder, we use grid predictor but with the input from CNN embedding
+        channels = None
+        height = None
+        width = None
+        
+        if not use_cnn_encoder:
+            # Only need these parameters for raw grid input
+            grid_dims = config.get("grid_dims", {})
+            channels = config.get("channels", 32)
+            height = grid_dims.get("H")
+            width = grid_dims.get("W")
+        
+        return GridPredictor(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_actions=num_actions,
+            action_embed_dim=action_embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            activation=activation,
+            channels=channels,
+            height=height,
+            width=width,
+            is_reward=is_reward
+        ) 

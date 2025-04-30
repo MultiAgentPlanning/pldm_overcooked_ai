@@ -6,11 +6,13 @@ import torch
 import numpy as np
 import logging
 import matplotlib.pyplot as plt
-import wandb
 from pathlib import Path
 from tqdm import tqdm
-from typing import Dict, List, Tuple, Optional, Any, Union
-import pandas as pd
+from typing import Dict, List, Tuple, Optional, Any, Union, NamedTuple
+from dataclasses import dataclass
+import torch.nn.functional as F
+import gc  # Import garbage collection
+import inspect
 
 # Add the parent directory to the path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -18,301 +20,402 @@ sys.path.append(str(Path(__file__).parent.parent))
 from solution.pldm.trainer import PLDMTrainer
 from solution.pldm.config import load_config, merge_configs, get_default_config
 from solution.pldm.utils import setup_logger, set_seeds
-from solution.pldm.prober import Prober, GridProber, VectorProber
+from solution.pldm.prober import Prober, VectorProber
 from solution.pldm.data_processor import get_overcooked_dataloaders
+
+# Attempt to import wandb, but don't fail if it's not installed
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    WANDB_AVAILABLE = False
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
 
-class ProbeTarget:
-    """Enumeration of different targets that can be probed."""
-    STATE = "state"  # Predict the full state
-    AGENT_POS = "agent_pos"  # Predict agent position
-    OBJECTS = "objects"  # Predict object positions
-    REWARD = "reward"  # Predict reward
+
+@dataclass
+class ProbeTargetConfig:
+    """Configuration for a specific probe target."""
+    arch: Optional[str] = "mlp"
+    subclass: Optional[str] = None
+    hidden_dims: Tuple[int, ...] = (128, 64)
 
 
-class ProberEvaluator:
+@dataclass
+class ProbingConfig:
+    """Main configuration for the probing process."""
+    # Target configuration
+    state_channels: ProbeTargetConfig = ProbeTargetConfig()
+    agent_pos: ProbeTargetConfig = ProbeTargetConfig()
+    reward: ProbeTargetConfig = ProbeTargetConfig()
+    
+    # Training parameters
+    lr: float = 1e-3
+    epochs: int = 50
+    batch_size: int = 64
+    seed: int = 42
+    max_samples: Optional[int] = None
+    
+    # Model selection
+    probe_dynamics: bool = True
+    probe_reward: bool = True
+    probe_encoder: bool = True    # Probe state encoder representations
+    probe_predictor: bool = False  # Probe dynamics predictor representations
+    
+    # Visualization
+    visualize: bool = True
+    max_vis_samples: int = 10
+    
+    # Save options
+    save_weights: bool = True     # Whether to save prober weights to disk
+    save_visualizations: bool = True  # Whether to generate and save visualizations
+    
+    # Other settings
+    use_wandb: bool = False
+    full_finetune: bool = False
+
+
+class ProbeResult(NamedTuple):
+    """Stores results from a probing task."""
+    model: torch.nn.Module
+    average_eval_loss: float
+    eval_losses_per_channel: List[float]
+    plots: List[Any]
+
+
+class StateChannels:
+    """Enumeration of different state channels that can be probed."""
+    AGENT1_POS = 0
+    AGENT1_ORIENTATION_UP = 1
+    AGENT1_ORIENTATION_DOWN = 2
+    AGENT1_ORIENTATION_LEFT = 3
+    AGENT1_ORIENTATION_RIGHT = 4
+    AGENT2_POS = 5
+    AGENT2_ORIENTATION_UP = 6
+    AGENT2_ORIENTATION_DOWN = 7
+    AGENT2_ORIENTATION_LEFT = 8
+    AGENT2_ORIENTATION_RIGHT = 9
+    AGENT1_HOLDING_ONION = 10
+    AGENT1_HOLDING_TOMATO = 11
+    AGENT1_HOLDING_DISH = 12
+    AGENT1_HOLDING_SOUP = 13
+    AGENT2_HOLDING_ONION = 14
+    AGENT2_HOLDING_TOMATO = 15
+    AGENT2_HOLDING_DISH = 16
+    AGENT2_HOLDING_SOUP = 17
+    ONION_ON_COUNTER = 18
+    TOMATO_ON_COUNTER = 19
+    DISH_ON_COUNTER = 20
+    SOUP_ON_COUNTER = 21
+    POT_EMPTY = 22
+    POT_COOKING = 23
+    POT_READY = 24
+    WALL = 25
+    COUNTER = 26
+    ONION_DISPENSER = 27
+    TOMATO_DISPENSER = 28
+    DISH_DISPENSER = 29
+    SERVING_LOCATION = 30
+    TIMESTEP = 31
+    
+    @classmethod
+    def get_channel_names(cls):
+        return [name for name in dir(cls) if not name.startswith('__') and not callable(getattr(cls, name))]
+    
+    @classmethod
+    def get_channel_values(cls):
+        return [getattr(cls, name) for name in cls.get_channel_names()]
+    
+    @classmethod
+    def get_channel_dict(cls):
+        return {name: getattr(cls, name) for name in cls.get_channel_names()}
+
+
+def squared_error_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Evaluates representations of the PLDM model by training probers
-    to predict various targets from the latent space.
+    Compute squared error loss between prediction and target.
+    
+    Args:
+        pred: Predicted tensor
+        target: Target tensor
+        
+    Returns:
+        Per-element squared error
     """
+    assert pred.shape == target.shape
+    return (pred - target).pow(2)
+
+
+class ProbingEvaluator:
+    """Evaluates representations from PLDM models by training probers."""
+    
     def __init__(
         self,
-        pldm_trainer: PLDMTrainer,
+        model: PLDMTrainer,
         output_dir: str,
-        config: Dict[str, Any],
+        config: ProbingConfig,
         device: torch.device = None,
-        wandb_run=None,
+        wandb_run = None,
     ):
         """
-        Initialize a ProberEvaluator.
+        Initialize the ProbingEvaluator.
         
         Args:
-            pldm_trainer: Trained PLDMTrainer instance
-            output_dir: Directory to save probers and results
-            config: Configuration dictionary
-            device: Device to use for training/evaluation
-            wandb_run: Optional WandB run for logging
+            model: Trained PLDMTrainer containing models to probe
+            output_dir: Directory to save probing results
+            config: Probing configuration
+            device: Device to use
+            wandb_run: Optional wandb run for logging
         """
-        self.pldm_trainer = pldm_trainer
+        self.model = model
         self.output_dir = Path(output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
         
         self.config = config
+        
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = device
         
-        # Extracting relevant settings from config
-        self.batch_size = config.get("batch_size", 32)
-        self.lr = config.get("lr", 1e-3)
-        self.epochs = config.get("epochs", 10)
-        self.model_type = config.get("model_type", pldm_trainer.model_type)
+        # Wandb setup
+        self.wandb_run = wandb_run
+        self.use_wandb = WANDB_AVAILABLE and (self.wandb_run is not None or config.use_wandb)
         
-        # Extract seed for reproducibility
-        self.seed = config.get("seed", 42)
+        # Set random seed
+        self.seed = config.seed
         self._set_seed()
         
-        # WandB logging setup
-        self.wandb_run = wandb_run
-        self.use_wandb = wandb_run is not None
+        # Data loaders for training and evaluation
+        self.train_loader = model.train_loader
+        self.val_loader = model.val_loader
+        self.test_loader = model.test_loader
+        
+        # Store model dimensions
+        self.state_dims = self._get_state_dimensions()
+        self.model_type = model.model_type
         
         # Dictionary to store probers
         self.probers = {}
         
-        logger.info(f"ProberEvaluator initialized with {self.model_type} model type and seed {self.seed}")
+        logger.info(f"ProbingEvaluator initialized with {self.model_type} model")
     
     def _set_seed(self):
         """Set random seed for reproducibility."""
-        from solution.pldm.utils import set_seeds
         set_seeds(self.seed)
-        logger.debug(f"Seed set to {self.seed} in ProberEvaluator")
-    
-    def create_prober(self, target: str, input_dim: int, output_dim: int):
+        logger.debug(f"Seed set to {self.seed}")
+        
+    def _get_state_dimensions(self):
+        """Get dimensions of the state representation."""
+        if not self.train_loader:
+            logger.error("No train loader available to determine state dimensions")
+            return None
+            
+        sample_batch = next(iter(self.train_loader))
+        state, _, _, _ = sample_batch
+        
+        return {
+            "batch_size": state.size(0),
+            "channels": state.size(1) if len(state.shape) > 3 else 1,
+            "height": state.size(2) if len(state.shape) > 3 else state.size(1),
+            "width": state.size(3) if len(state.shape) > 3 else state.size(2)
+        }
+        
+    def _context_manager(self):
+        """Context manager for gradient computation based on whether we're finetuning."""
+        return torch.enable_grad() if self.config.full_finetune else torch.no_grad()
+        
+    def _get_model_representation(self, batch, model_type, repr_type='encoder'):
         """
-        Create an appropriate prober based on model type and target.
+        Extract representation from the model.
         
         Args:
-            target: Target to probe (from ProbeTarget)
-            input_dim: Dimension of input representation
-            output_dim: Dimension of output prediction
+            batch: Input batch of data
+            model_type: 'dynamics' or 'reward'
+            repr_type: 'encoder' or 'predictor'
             
         Returns:
-            Prober model instance
-        """
-        # We're dealing with vector embeddings (state_embed_dim) returned by models
-        # Use the VectorProber regardless of the original model type
-        logger.info(f"Creating prober with input_dim={input_dim}, output_dim={output_dim}")
-        return VectorProber(
-            input_dim=input_dim,
-            output_dim=output_dim,
-            hidden_dims=(128, 64)
-        )
-    
-    def get_representation_and_target(self, batch, target: str, model_type: str):
-        """
-        Extract the representation and corresponding target from a batch.
-        
-        Args:
-            batch: Batch of data
-            target: Target to probe
-            model_type: 'dynamics' or 'reward' to specify which model's representations to use
-            
-        Returns:
-            Tuple of (representation, target)
+            Model representation
         """
         state, action, next_state, reward = batch
         
         # Move to device
         state = state.to(self.device)
         action = action.to(self.device)
-        next_state = next_state.to(self.device)
-        if isinstance(reward, torch.Tensor):
-            reward = reward.to(self.device)
+        next_state = next_state.to(self.device) # Ensure next_state is also on device
         
-        # Get model
+        # Get the appropriate model
         if model_type == 'dynamics':
-            model = self.pldm_trainer.dynamics_model
+            model = self.model.dynamics_model
         else:  # reward
-            model = self.pldm_trainer.reward_model
+            model = self.model.reward_model
         
-        # Get representation (latent encoding)
+        # Check if CNN encoder exists and should be used
+        # Assumes self.model is the PLDMTrainer instance or has similar attributes
+        use_cnn = hasattr(self.model, 'cnn_encoder') and self.model.cnn_encoder is not None
+        
+        # Extract representation based on type
         with torch.no_grad():
-            try:
-                # Get the embedding from the model's encoder if available
-                if hasattr(model, 'encode'):
-                    representation = model.encode(state, action)
-                elif hasattr(model, 'encoder') and callable(getattr(model, 'encoder')):
-                    representation = model.encoder(state)
-                else:
-                    # Use the model's forward pass with return_embedding=True
-                    representation = model(state, action, return_embedding=True)
-                
-                logger.debug(f"Got representation of shape {representation.shape}")
-            except Exception as e:
-                logger.error(f"Error getting representation: {e}")
-                raise
-        
-        # Prepare target based on requested probe target
-        try:
-            if target == ProbeTarget.STATE:
-                # For state prediction, we need to handle different state formats
-                if self.model_type == "grid" and next_state.dim() == 4:
-                    # For grid states, flatten to make it easier to predict
-                    batch_size = next_state.size(0)
-                    target_tensor = next_state.view(batch_size, -1)
-                else:
-                    # For vector states, use as is
-                    target_tensor = next_state
-                    
-                logger.debug(f"State target shape: {target_tensor.shape}")
-                
-            elif target == ProbeTarget.REWARD:
-                # Ensure reward is a tensor with shape [batch_size, 1]
-                if isinstance(reward, torch.Tensor):
-                    if reward.dim() == 1:
-                        target_tensor = reward.unsqueeze(1)
-                    else:
-                        target_tensor = reward
-                else:
-                    # Convert to tensor if not already
-                    reward_np = np.array(reward).reshape(-1, 1)
-                    target_tensor = torch.tensor(reward_np, dtype=torch.float32, device=self.device)
-                
-                logger.debug(f"Reward target shape: {target_tensor.shape}")
-                
-            elif target == ProbeTarget.AGENT_POS:
-                # Extract agent positions
-                target_tensor = self._extract_agent_pos(state)
-                logger.debug(f"Agent position target shape: {target_tensor.shape}")
-                
+            if use_cnn and self.model_type == 'grid':
+                # Use CNN encoder first
+                state_embed = self.model.cnn_encoder(state)
+                next_state_embed = self.model.cnn_encoder(next_state)
             else:
-                raise ValueError(f"Unsupported probe target: {target}")
+                # Use raw state if no CNN or not grid model
+                state_embed = state
+                next_state_embed = next_state
                 
-        except Exception as e:
-            logger.error(f"Error preparing target {target}: {e}")
-            raise
-            
-        return representation, target_tensor
-    
-    def _extract_agent_pos(self, state):
+            # Now use the embeddings (or raw states) with the predictor/encoder logic
+            if repr_type == 'encoder':
+                # For encoder probing, we want the representation *before* the predictor
+                # If CNN was used, state_embed is the CNN output. Otherwise, it's raw state.
+                # If the model itself is just an encoder (e.g., CNNStateEncoderNetwork passed directly), 
+                # we might need different logic, but here we assume model is Dynamics/Reward Predictor.
+                # Let's return state_embed which is either raw state or CNN output
+                representation = state_embed
+            else:  # predictor
+                # For predictor probing, we want the output of the dynamics/reward predictor
+                # The predictor takes the state embedding (or raw state) and action
+                
+                # Check if model is Transformer or similar that needs return_embedding=True for predictor's internal rep
+                from solution.pldm.predictors import TransformerPredictor, LSTMPredictor
+                if isinstance(model, (TransformerPredictor, LSTMPredictor)):
+                     # These models predict the *next* state embedding when return_embedding=True
+                    representation = model(state_embed, action, return_embedding=True)
+                elif hasattr(model, 'forward') and 'return_embedding' in inspect.signature(model.forward).parameters:
+                     # Other predictors might use return_embedding for their internal state
+                    representation = model(state_embed, action, return_embedding=True)
+                else:
+                     # Fallback: use the standard output of the model as the representation
+                    # For dynamics, this might be the predicted next state grid/vector (not embedding)
+                    # For reward, this would be the scalar reward
+                    representation = model(state_embed, action)
+                
+        return representation
+
+    def _get_state_channel_target(self, batch, channel_index, repr_type='encoder'):
         """
-        Extract agent position from state.
-        This is a simplified placeholder that needs to handle both grid and vector states.
+        Extract a specific channel from the state tensor as a probing target.
         
         Args:
-            state: Batch of states
+            batch: Input batch
+            channel_index: Index of channel to extract
+            repr_type: The representation type being used ('encoder' or 'predictor')
             
         Returns:
-            Tensor of agent positions
+            Channel data as target tensor
         """
-        # For simplicity in probing, we'll just return a placeholder position
-        # This avoids indexing errors while still allowing the probing to run
-        bs = state.size(0)
-        pos = torch.zeros((bs, 2), device=self.device)
+        # For predictor representation, we want to predict the next state channels
+        # For encoder representation, we use the current state channels
+        if repr_type == 'predictor':
+            _, _, state_tensor, _ = batch  # Use next_state for predictor
+        else:
+            state_tensor, _, _, _ = batch  # Use current state for encoder
         
-        if self.model_type == "grid" and state.dim() == 4:
-            # Only attempt to extract real positions if we have grid states with expected dimensions
-            try:
-                # Assuming channel 0 and 1 represent agent positions
-                agent1_channel = 0
-                
-                for i in range(bs):
-                    # Find agent 1 position (first agent)
-                    agent_mask = state[i, agent1_channel]
-                    if agent_mask.sum() > 0:  # If agent is present
-                        agent_pos = agent_mask.nonzero()
-                        if agent_pos.size(0) > 0:  # If we found any positions
-                            # Take the first occurrence
-                            pos[i, 0] = agent_pos[0, 0]  # Y position (height)
-                            pos[i, 1] = agent_pos[0, 1]  # X position (width)
-            except Exception as e:
-                logger.warning(f"Error extracting agent positions: {e}. Using zeros.")
-                
-        return pos
-    
-    def train_prober(
+        state_tensor = state_tensor.to(self.device)
+        
+        if self.model_type == "grid" and len(state_tensor.shape) > 3:
+            # For grid states, extract the specific channel
+            target = state_tensor[:, channel_index, :, :]
+            # Flatten spatial dimensions
+            target = target.reshape(target.size(0), -1)
+        else:
+            # For vector states, this is harder - assume all data is flattened
+            raise ValueError("State channel extraction not supported for vector states")
+            
+        return target
+            
+    def create_prober(self, input_dim, output_dim, config: ProbeTargetConfig):
+        """
+        Create a prober model with the specified dimensions.
+        
+        Args:
+            input_dim: Dimension of input representation
+            output_dim: Dimension of output to predict
+            config: Configuration for this prober
+            
+        Returns:
+            Initialized prober model
+        """
+        logger.info(f"Creating prober with input_dim={input_dim}, output_dim={output_dim}")
+        
+        if config.arch == "mlp":
+            return VectorProber(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_dims=config.hidden_dims
+            )
+        else:
+            raise ValueError(f"Unsupported prober architecture: {config.arch}")
+            
+    def train_prober_for_channel(
         self,
-        target: str,
+        channel_index: int,
         model_type: str = 'dynamics',
-        output_dim: int = None,
-        train_loader=None,
-        val_loader=None
+        repr_type: str = 'encoder',
+        epoch: int = 0
     ):
         """
-        Train a prober to predict a specific target from model representations.
+        Train a prober to predict a specific state channel from model representations.
         
         Args:
-            target: Target to predict (from ProbeTarget)
-            model_type: 'dynamics' or 'reward' to specify which model's representations to use
-            output_dim: Dimension of the output (if None, inferred from data)
-            train_loader: DataLoader for training (if None, use trainer's)
-            val_loader: DataLoader for validation (if None, use trainer's)
+            channel_index: Index of state channel to probe
+            model_type: 'dynamics' or 'reward'
+            repr_type: 'encoder' or 'predictor'
+            epoch: Current epoch number
             
         Returns:
-            Trained prober
+            Trained prober model
         """
         # Set seed for reproducibility
         self._set_seed()
-        logger.info(f"Training {model_type} prober for target: {target} with seed {self.seed}")
+        channel_names = StateChannels.get_channel_names()
+        channel_name = channel_names[channel_index] if channel_index < len(channel_names) else f"channel_{channel_index}"
+        logger.info(f"Training {model_type} {repr_type} prober for channel: {channel_name} (index {channel_index})")
         
         # Get data loaders
-        if train_loader is None or val_loader is None:
-            if not hasattr(self.pldm_trainer, 'train_loader') or not hasattr(self.pldm_trainer, 'val_loader'):
-                # If trainer doesn't have loaders, try to create them
-                logger.info("Creating data loaders for prober training...")
-                train_loader, val_loader, _ = get_overcooked_dataloaders(
-                    data_path=self.config.get("data_path", ""),
-                    state_encoder_type=self.model_type,
-                    batch_size=self.batch_size,
-                    val_ratio=0.1,
-                    test_ratio=0.1,
-                    max_samples=self.config.get("max_samples", None),
-                    num_workers=self.config.get("num_workers", 4),
-                    seed=self.seed  # Use consistent seed for reproducible data splits
-                )
-            else:
-                train_loader = self.pldm_trainer.train_loader
-                val_loader = self.pldm_trainer.val_loader
+        train_loader = self.train_loader
+        val_loader = self.val_loader
         
-        # Get a batch to determine input and output dimensions
+        if not train_loader or not val_loader:
+            raise ValueError("Train or validation loader not available")
+        
+        # Get a batch to determine dimensions
         batch = next(iter(train_loader))
-        representation, target_tensor = self.get_representation_and_target(batch, target, model_type)
+        representation = self._get_model_representation(batch, model_type, repr_type)
+        target = self._get_state_channel_target(batch, channel_index, repr_type)
         
-        input_dim = representation.size(1) if representation.dim() == 2 else representation.shape[1:]
-        if output_dim is None:
-            if target_tensor.dim() > 1:
-                output_dim = target_tensor.size(1)
-            else:
-                output_dim = 1
+        input_dim = representation.size(1)
+        output_dim = target.size(1)
         
-        # Create prober with seed set for reproducible initialization
-        self._set_seed()
-        prober = self.create_prober(target, input_dim, output_dim)
+        # Create prober
+        self._set_seed()  # Reset seed for consistent initialization
+        config = self.config.state_channels
+        prober = self.create_prober(input_dim, output_dim, config)
         prober = prober.to(self.device)
         
-        # Setup optimizer
-        optimizer = torch.optim.Adam(prober.parameters(), lr=self.lr)
+        # Set up optimizer
+        optimizer = torch.optim.Adam(prober.parameters(), lr=self.config.lr)
         criterion = torch.nn.MSELoss()
         
         # Training loop
         best_val_loss = float('inf')
         
-        for epoch in range(self.epochs):
-            # Training
+        for epoch in range(self.config.epochs):
+            # Training phase
             prober.train()
-            train_loss = 0
+            train_loss = 0.0
             train_batches = 0
             
-            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs} Train"):
-                representation, target_tensor = self.get_representation_and_target(batch, target, model_type)
+            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.epochs} - Training"):
+                representation = self._get_model_representation(batch, model_type, repr_type)
+                target = self._get_state_channel_target(batch, channel_index, repr_type)
                 
                 optimizer.zero_grad()
-                
                 prediction = prober(representation)
-                loss = criterion(prediction, target_tensor)
+                loss = criterion(prediction, target)
                 
                 loss.backward()
                 optimizer.step()
@@ -322,17 +425,18 @@ class ProberEvaluator:
             
             avg_train_loss = train_loss / train_batches if train_batches > 0 else 0
             
-            # Validation
+            # Validation phase
             prober.eval()
-            val_loss = 0
+            val_loss = 0.0
             val_batches = 0
             
             with torch.no_grad():
-                for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{self.epochs} Validate"):
-                    representation, target_tensor = self.get_representation_and_target(batch, target, model_type)
+                for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{self.config.epochs} - Validation"):
+                    representation = self._get_model_representation(batch, model_type, repr_type)
+                    target = self._get_state_channel_target(batch, channel_index, repr_type)
                     
                     prediction = prober(representation)
-                    loss = criterion(prediction, target_tensor)
+                    loss = criterion(prediction, target)
                     
                     val_loss += loss.item()
                     val_batches += 1
@@ -344,63 +448,73 @@ class ProberEvaluator:
             # Log to WandB
             if self.use_wandb:
                 self.wandb_run.log({
-                    f"prober_{model_type}_{target}/train_loss": avg_train_loss,
-                    f"prober_{model_type}_{target}/val_loss": avg_val_loss,
-                    f"prober_{model_type}_{target}/epoch": epoch + 1
+                    f"prober_{model_type}_{repr_type}_{channel_name}/train_loss": avg_train_loss,
+                    f"prober_{model_type}_{repr_type}_{channel_name}/val_loss": avg_val_loss,
+                    f"prober_{model_type}_{repr_type}_{channel_name}/epoch": epoch + 1
                 })
             
-            # Save best model
+            # Save best model if configured to do so
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                prober_path = self.output_dir / f"prober_{model_type}_{target}.pt"
                 
-                torch.save({
-                    'state_dict': prober.state_dict(),
-                    'config': {
-                        'input_dim': input_dim,
-                        'output_dim': output_dim,
-                        'model_type': self.model_type,
-                        'target': target
-                    }
-                }, prober_path)
+                # Save model weights if configured
+                if self.config.save_weights:
+                    prober_path = self.output_dir / f"prober_{model_type}_{repr_type}_{channel_name}.pt"
                 
-                logger.info(f"New best {model_type} prober for {target} saved to {prober_path}")
+                    torch.save({
+                        'state_dict': prober.state_dict(),
+                        'config': {
+                            'input_dim': input_dim,
+                            'output_dim': output_dim,
+                            'model_type': model_type,
+                            'repr_type': repr_type,
+                            'channel_index': channel_index,
+                            'channel_name': channel_name
+                        }
+                    }, prober_path)
+                
+                    logger.info(f"New best {model_type} {repr_type} prober for {channel_name} saved to {prober_path}")
+                else:
+                    logger.info(f"New best {model_type} {repr_type} prober for {channel_name} (weights not saved)")
         
         # Store the prober
-        self.probers[f"{model_type}_{target}"] = prober
+        key = f"{model_type}_{repr_type}_{channel_name}"
+        self.probers[key] = prober
         
         return prober
     
-    def evaluate_prober(
+    def evaluate_prober_for_channel(
         self,
         prober,
-        target: str,
+        channel_index: int,
         model_type: str = 'dynamics',
-        test_loader=None,
+        repr_type: str = 'encoder',
         visualize: bool = True
     ):
         """
-        Evaluate a trained prober and visualize results.
+        Evaluate a trained prober on the test set.
         
         Args:
             prober: Trained prober model
-            target: Target that was probed
+            channel_index: Index of state channel being probed
             model_type: 'dynamics' or 'reward'
-            test_loader: DataLoader for testing (if None, use trainer's test_loader)
-            visualize: Whether to generate visualizations
+            repr_type: 'encoder' or 'predictor'
+            visualize: Whether to create visualizations
         
         Returns:
-            Dict of evaluation metrics
+            Dictionary of evaluation metrics
         """
-        # Set seed for reproducible evaluation
+        # Set seed for reproducibility
         self._set_seed()
-        logger.info(f"Evaluating {model_type} prober for target: {target} with seed {self.seed}")
+        channel_names = StateChannels.get_channel_names()
+        channel_name = channel_names[channel_index] if channel_index < len(channel_names) else f"channel_{channel_index}"
+        logger.info(f"Evaluating {model_type} {repr_type} prober for channel: {channel_name}")
         
-        if test_loader is None:
-            if not hasattr(self.pldm_trainer, 'test_loader'):
+        if not self.test_loader:
                 logger.error("No test loader available for evaluation")
                 return {}
-            test_loader = self.pldm_trainer.test_loader
+            
+        test_loader = self.test_loader
         
         prober.eval()
         criterion = torch.nn.MSELoss(reduction='none')
@@ -410,18 +524,16 @@ class ProberEvaluator:
         all_targets = []
         
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Evaluating prober"):
-                representation, target_tensor = self.get_representation_and_target(batch, target, model_type)
+            for batch in tqdm(test_loader, desc=f"Evaluating {channel_name} prober"):
+                representation = self._get_model_representation(batch, model_type, repr_type)
+                target = self._get_state_channel_target(batch, channel_index, repr_type)
                 
                 prediction = prober(representation)
+                loss = criterion(prediction, target)
                 
-                # Compute loss per sample/dimension
-                loss = criterion(prediction, target_tensor)
-                
-                # Store results
                 all_losses.append(loss)
                 all_predictions.append(prediction.cpu())
-                all_targets.append(target_tensor.cpu())
+                all_targets.append(target.cpu())
         
         # Concatenate results
         all_losses = torch.cat(all_losses, dim=0)
@@ -430,160 +542,172 @@ class ProberEvaluator:
         
         # Calculate metrics
         mean_loss = all_losses.mean().item()
-        rmse = torch.sqrt(all_losses.mean()).item()
         
-        # Calculate R^2 score
-        target_var = torch.var(all_targets, dim=0, unbiased=False)
-        unexplained_var = torch.var(all_targets - all_predictions, dim=0, unbiased=False)
-        r2_score = 1 - (unexplained_var / target_var)
-        mean_r2 = r2_score.mean().item()
+        # Calculate per-element losses to understand which parts are predicted well
+        per_element_loss = all_losses.mean(dim=0)
         
         # Compile metrics
         metrics = {
             'mean_loss': mean_loss,
-            'rmse': rmse,
-            'r2_score': mean_r2
+            'per_element_loss': per_element_loss.tolist()
         }
         
-        logger.info(f"Prober evaluation results for {model_type}_{target}:")
+        logger.info(f"Prober evaluation results for {model_type}_{repr_type}_{channel_name}:")
         logger.info(f"  Mean Loss: {mean_loss:.6f}")
-        logger.info(f"  RMSE: {rmse:.6f}")
-        logger.info(f"  R² Score: {mean_r2:.6f}")
         
         # Log to WandB
         if self.use_wandb:
             self.wandb_run.log({
-                f"prober_{model_type}_{target}/test_loss": mean_loss,
-                f"prober_{model_type}_{target}/test_rmse": rmse,
-                f"prober_{model_type}_{target}/test_r2": mean_r2
+                f"prober_{model_type}_{repr_type}_{channel_name}/test_loss": mean_loss
             })
         
         # Visualize results if requested
-        if visualize:
-            self.visualize_prober_results(
+        if visualize and self.config.visualize and self.config.save_visualizations:
+            self.visualize_channel_results(
                 predictions=all_predictions,
                 targets=all_targets,
-                target_type=target,
-                model_type=model_type
+                channel_index=channel_index,
+                model_type=model_type,
+                repr_type=repr_type
             )
+        elif visualize and self.config.visualize:
+            logger.info(f"Skipping visualization for {model_type}_{repr_type}_{channel_name} (save_visualizations disabled)")
         
         return metrics
     
-    def visualize_prober_results(
+    def visualize_channel_results(
         self,
         predictions: torch.Tensor,
         targets: torch.Tensor,
-        target_type: str,
-        model_type: str
+        channel_index: int,
+        model_type: str,
+        repr_type: str
     ):
         """
-        Generate visualizations of prober predictions vs. targets.
+        Visualize the predictions vs targets for a specific channel.
         
         Args:
             predictions: Tensor of predictions
-            targets: Tensor of ground truth targets
-            target_type: Type of target being predicted
+            targets: Tensor of ground truth values
+            channel_index: Index of state channel being visualized
             model_type: 'dynamics' or 'reward'
+            repr_type: 'encoder' or 'predictor'
         """
-        # Determine an appropriate number of samples to visualize
-        n_samples = min(10, predictions.size(0))
+        channel_names = StateChannels.get_channel_names()
+        channel_name = channel_names[channel_index] if channel_index < len(channel_names) else f"channel_{channel_index}"
+        
+        # Determine number of samples to visualize
+        n_samples = min(self.config.max_vis_samples, predictions.size(0))
+        n_elements = min(100, predictions.size(1))  # Limit elements for clarity in visualization
         
         # Convert to numpy for plotting
-        predictions_np = predictions[:n_samples].numpy()
-        targets_np = targets[:n_samples].numpy()
+        predictions_np = predictions[:n_samples, :n_elements].numpy()
+        targets_np = targets[:n_samples, :n_elements].numpy()
         
-        if target_type == ProbeTarget.REWARD:
-            # For reward predictions, create a scatter plot
-            plt.figure(figsize=(10, 6))
-            plt.scatter(targets_np, predictions_np, alpha=0.5)
+        # Calculate grid dimensions
+        h = w = int(np.sqrt(n_elements))
+        if h * w < n_elements:
+            w += 1
+            if h * w < n_elements:
+                h += 1
+                
+        # Create heatmap visualizations for select samples
+        for i in range(n_samples):
+            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
             
-            # Add diagonal line for perfect predictions
-            min_val = min(targets_np.min(), predictions_np.min())
-            max_val = max(targets_np.max(), predictions_np.max())
-            plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+            # Plot target
+            target_reshaped = targets_np[i].reshape(h, w)
+            im1 = ax1.imshow(target_reshaped, cmap='viridis')
+            ax1.set_title('Target')
+            plt.colorbar(im1, ax=ax1)
             
-            plt.xlabel('True Reward')
-            plt.ylabel('Predicted Reward')
-            plt.title(f'{model_type.capitalize()} Model - Reward Predictions')
+            # Plot prediction
+            pred_reshaped = predictions_np[i].reshape(h, w)
+            im2 = ax2.imshow(pred_reshaped, cmap='viridis')
+            ax2.set_title('Prediction')
+            plt.colorbar(im2, ax=ax2)
+            
+            # Plot difference
+            diff = np.abs(targets_np[i] - predictions_np[i]).reshape(h, w)
+            im3 = ax3.imshow(diff, cmap='hot')
+            ax3.set_title('Absolute Difference')
+            plt.colorbar(im3, ax=ax3)
+            
+            plt.suptitle(f'{model_type.capitalize()} Model - {repr_type.capitalize()} {channel_name} Predictions (Sample {i+1})')
             
             # Save figure
-            plt_path = self.output_dir / f"{model_type}_{target_type}_scatter.png"
+            plt_path = self.output_dir / f"{model_type}_{repr_type}_{channel_name}_sample{i+1}.png"
             plt.savefig(plt_path)
             
             # Log to WandB
             if self.use_wandb:
-                self.wandb_run.log({f"{model_type}_{target_type}_scatter": wandb.Image(plt)})
+                self.wandb_run.log({f"{model_type}_{repr_type}_{channel_name}_sample{i+1}": wandb.Image(plt)})
+                
+            plt.close(fig)
             
-            plt.close()
+        # Create a correlation plot with all samples
+        if n_elements <= 10:  # Only for small number of elements
+            fig = plt.figure(figsize=(10, 8))
             
-        elif target_type in [ProbeTarget.AGENT_POS, ProbeTarget.OBJECTS]:
-            # For position predictions, create plots showing predicted vs. actual positions
-            for i in range(n_samples):
-                plt.figure(figsize=(8, 8))
+            # Flatten all samples
+            all_preds = predictions_np.flatten()
+            all_targets = targets_np.flatten()
+            
+            plt.scatter(all_targets, all_preds, alpha=0.3)
+            
+            # Add diagonal line for perfect predictions
+            min_val = min(all_targets.min(), all_preds.min())
+            max_val = max(all_targets.max(), all_preds.max())
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+            
+            plt.xlabel('True Values')
+            plt.ylabel('Predicted Values')
+            plt.title(f'{model_type.capitalize()} Model - {repr_type.capitalize()} {channel_name} Correlation')
+            
+            # Save figure
+            plt_path = self.output_dir / f"{model_type}_{repr_type}_{channel_name}_correlation.png"
+            plt.savefig(plt_path)
+            
+            # Log to WandB
+            if self.use_wandb:
+                self.wandb_run.log({f"{model_type}_{repr_type}_{channel_name}_correlation": wandb.Image(plt)})
                 
-                # Plot actual positions
-                plt.scatter(
-                    targets_np[i, 0::2],  # x coordinates
-                    targets_np[i, 1::2],  # y coordinates
-                    color='blue',
-                    label='True Position'
-                )
-                
-                # Plot predicted positions
-                plt.scatter(
-                    predictions_np[i, 0::2],  # x coordinates
-                    predictions_np[i, 1::2],  # y coordinates
-                    color='red',
-                    label='Predicted Position'
-                )
-                
-                # Connect corresponding points with lines
-                for j in range(0, targets_np.shape[1], 2):
-                    plt.plot(
-                        [targets_np[i, j], predictions_np[i, j]],
-                        [targets_np[i, j+1], predictions_np[i, j+1]],
-                        'k--', alpha=0.3
-                    )
-                
-                plt.legend()
-                plt.xlabel('X Position')
-                plt.ylabel('Y Position')
-                plt.title(f'{model_type.capitalize()} Model - Position Predictions (Sample {i+1})')
-                
-                # Save figure
-                plt_path = self.output_dir / f"{model_type}_{target_type}_sample{i+1}.png"
-                plt.savefig(plt_path)
-                
-                # Log to WandB
-                if self.use_wandb:
-                    self.wandb_run.log({f"{model_type}_{target_type}_sample{i+1}": wandb.Image(plt)})
-                
-                plt.close()
-        
-        # For other target types, create appropriate visualizations
-        else:
-            logger.info(f"Visualization not implemented for target type: {target_type}")
+            plt.close(fig)
     
-    def train_all_probers(self):
+    def train_probers_for_all_channels(self):
         """
-        Train probers for all combinations of models and targets.
+        Train probers for all state channels with both dynamics and reward models.
         
         Returns:
-            Dict mapping (model_type, target) to evaluation metrics
+            Dictionary of evaluation results
         """
-        # Set seed for reproducible results
+        # Set seed for reproducibility
         self._set_seed()
-        logger.info(f"Training all probers with seed {self.seed}")
+        logger.info(f"Training probers for all state channels")
         
         results = {}
         
-        # Define models and targets to probe
-        models = ['dynamics', 'reward']
-        targets = [ProbeTarget.STATE, ProbeTarget.REWARD]
+        # Get all channel indices to probe
+        channel_indices = StateChannels.get_channel_values()
+        channel_names = StateChannels.get_channel_names()
         
-        # Add agent position if configured
-        if self.config.get("probe_agent_pos", True):
-            targets.append(ProbeTarget.AGENT_POS)
+        # Define which models to probe
+        models = []
+        if self.config.probe_dynamics:
+            models.append('dynamics')
+        if self.config.probe_reward:
+            models.append('reward')
+            
+        # Define which representation types to probe
+        repr_types = []
+        if self.config.probe_encoder:
+            repr_types.append('encoder')
+        if self.config.probe_predictor:
+            repr_types.append('predictor')
+            
+        if not repr_types:
+            logger.warning("No representation types selected for probing. Defaulting to encoder.")
+            repr_types = ['encoder']
         
         # Save probing configuration for reproducibility
         probe_config_path = self.output_dir / "probe_config.json"
@@ -591,32 +715,53 @@ class ProberEvaluator:
             json.dump({
                 'seed': self.seed,
                 'model_type': self.model_type,
-                'batch_size': self.batch_size,
-                'epochs': self.epochs,
-                'lr': self.lr,
-                'targets': [t for t in targets],
-                'models': models
+                'batch_size': self.config.batch_size,
+                'epochs': self.config.epochs,
+                'lr': self.config.lr,
+                'channels': channel_names,
+                'models': models,
+                'repr_types': repr_types,
+                'save_weights': self.config.save_weights,
+                'save_visualizations': self.config.save_visualizations
             }, f, indent=2)
         logger.info(f"Saved probing configuration to {probe_config_path}")
         
         # Train and evaluate probers for each combination
         for model_type in models:
-            for target in targets:
-                # Skip reward model probing reward (redundant)
-                if model_type == 'reward' and target == ProbeTarget.REWARD:
-                    continue
+            for repr_type in repr_types:
+                logger.info(f"Training probers for {model_type} model using {repr_type} representations")
+                for idx, channel_index in enumerate(channel_indices):
+                    channel_name = channel_names[idx]
                 
-                # Set seed before each probing task
-                self._set_seed()
+                    # Set seed before each probing task
+                    self._set_seed()
+                    
+                    # Train prober
+                    prober = self.train_prober_for_channel(
+                        channel_index=channel_index,
+                        model_type=model_type,
+                        repr_type=repr_type
+                    )
+                    
+                    # Evaluate prober
+                    metrics = self.evaluate_prober_for_channel(
+                        prober=prober,
+                        channel_index=channel_index,
+                        model_type=model_type,
+                        repr_type=repr_type
+                    )
                 
-                prober = self.train_prober(target, model_type)
-                metrics = self.evaluate_prober(prober, target, model_type)
+                    # Include seed in metrics for reference
+                    metrics['seed'] = self.seed
+                    results[(model_type, repr_type, channel_name)] = metrics
+                    
+                    # Free up memory after processing each channel
+                    logger.info(f"Cleaning up memory after processing channel {channel_name}")
+                    del prober
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 
-                # Include seed in metrics for reference
-                metrics['seed'] = self.seed
-                results[(model_type, target)] = metrics
-        
-        # Aggregate results
+        # Aggregate and summarize results
         self.aggregate_results(results)
         
         return results
@@ -626,32 +771,32 @@ class ProberEvaluator:
         Aggregate and summarize probing results.
         
         Args:
-            results: Dict mapping (model_type, target) to metrics
+            results: Dict mapping (model_type, repr_type, channel_name) to metrics
         """
         # Create a summary table
         summary = []
         
-        for (model_type, target), metrics in results.items():
+        for (model_type, repr_type, channel_name), metrics in results.items():
             summary.append({
                 'Model': model_type,
-                'Target': target,
+                'ReprType': repr_type,
+                'Channel': channel_name,
                 'MSE': metrics['mean_loss'],
-                'RMSE': metrics['rmse'],
-                'R²': metrics['r2_score']
             })
         
-        # Sort by model type then target
-        summary.sort(key=lambda x: (x['Model'], x['Target']))
+        # Sort by model type, representation type, then channel
+        summary.sort(key=lambda x: (x['Model'], x['ReprType'], x['Channel']))
         
         # Print summary table
         logger.info("\n--- Probing Results Summary ---")
-        logger.info(f"{'Model':<10} {'Target':<10} {'MSE':<10} {'RMSE':<10} {'R²':<10}")
-        logger.info("-" * 50)
+        logger.info(f"{'Model':<10} {'ReprType':<10} {'Channel':<25} {'MSE':<10}")
+        logger.info("-" * 57) # Adjusted length
         
         for row in summary:
+            # Update row format
             logger.info(
-                f"{row['Model']:<10} {row['Target']:<10} "
-                f"{row['MSE']:<10.6f} {row['RMSE']:<10.6f} {row['R²']:<10.6f}"
+                f"{row['Model']:<10} {row['ReprType']:<10} {row['Channel']:<25} "
+                f"{row['MSE']:<10.6f}"
             )
         
         # Save summary to JSON
@@ -661,50 +806,93 @@ class ProberEvaluator:
         
         # Log summary to WandB
         if self.use_wandb:
-            # Create a table
+            # Create a table with updated columns
             wandb_table = wandb.Table(
-                columns=["Model", "Target", "MSE", "RMSE", "R²"]
+                columns=["Model", "ReprType", "Channel", "MSE"]
             )
             
             for row in summary:
+                # Update data added to table
                 wandb_table.add_data(
                     row['Model'],
-                    row['Target'],
-                    row['MSE'],
-                    row['RMSE'],
-                    row['R²']
+                    row['ReprType'],
+                    row['Channel'],
+                    row['MSE']
                 )
             
             self.wandb_run.log({"probing_summary": wandb_table})
+            
+        # Create comparative visualizations
+        self.visualize_comparative_results(summary)
+        
+    def visualize_comparative_results(self, summary):
+        """
+        Create comparative visualizations across channels and models.
+        
+        Args:
+            summary: List of result dictionaries
+        """
+        # Skip visualization if disabled
+        if not self.config.save_visualizations:
+            logger.info("Skipping comparative visualizations (save_visualizations disabled)")
+            return
+            
+        # REMOVING R2-based bar plot visualization
+        logger.info("R2-based comparative bar plot visualization removed.")
+        
+        # REMOVING R2-based Encoder vs Predictor scatter plot visualization
+        logger.info("R2-based Encoder vs Predictor scatter plot visualization removed.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train and evaluate probers for PLDM models")
+    parser = argparse.ArgumentParser(description="Probe PLDM models to predict state channels")
     
     # Config file and model paths
     parser.add_argument("--config", type=str, required=True,
                         help="Path to configuration file")
     parser.add_argument("--model_dir", type=str, required=True,
                         help="Directory containing trained PLDM models")
-    parser.add_argument("--output_dir", type=str, default="probing_results",
+    parser.add_argument("--output_dir", type=str, default="channel_probing_results",
                         help="Directory to save probing results")
     
     # Probing settings
-    parser.add_argument("--targets", type=str, default="state,reward",
-                        help="Comma-separated list of targets to probe (state,reward,agent_pos)")
-    parser.add_argument("--epochs", type=int, default=10,
+    parser.add_argument("--epochs", type=int, default=30,
                         help="Number of epochs to train probers")
-    parser.add_argument("--batch_size", type=int, default=32,
+    parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size for training probers")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate for training probers")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
     
-    # Visualization and logging settings
-    parser.add_argument("--visualize", action="store_true",
+    # Model selection
+    parser.add_argument("--probe_dynamics", action="store_true", default=True,
+                        help="Probe dynamics model")
+    parser.add_argument("--probe_reward", action="store_true", default=True,
+                        help="Probe reward model")
+    parser.add_argument("--probe_encoder", action="store_true", default=True,
+                        help="Probe state encoder representations")
+    parser.add_argument("--probe_predictor", action="store_true", default=False,
+                        help="Probe dynamics predictor representations")
+    
+    # Visualization and logging
+    parser.add_argument("--visualize", action="store_true", default=True,
                         help="Generate visualizations of probing results")
+    parser.add_argument("--no_visualize", action="store_false", dest="visualize",
+                        help="Skip generating visualizations")
+    parser.add_argument("--save_weights", action="store_true", default=True,
+                        help="Save prober model weights to disk")
+    parser.add_argument("--no_save_weights", action="store_false", dest="save_weights",
+                        help="Skip saving prober model weights (saves disk space)")
+    parser.add_argument("--save_visualizations", action="store_true", default=True,
+                        help="Save visualization images to disk")
+    parser.add_argument("--no_save_visualizations", action="store_false", dest="save_visualizations",
+                        help="Skip saving visualization images (saves disk space)")
+    parser.add_argument("--max_vis_samples", type=int, default=5,
+                        help="Maximum number of samples to visualize")
     parser.add_argument("--use_wandb", action="store_true",
                         help="Log results to Weights & Biases")
-    parser.add_argument("--wandb_project", type=str, default="pldm-probing",
+    parser.add_argument("--wandb_project", type=str, default="pldm-channel-probing",
                         help="WandB project name")
     parser.add_argument("--log_level", type=str, default="INFO",
                         help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
@@ -726,17 +914,22 @@ def main():
             logger.error(f"Error loading config: {e}")
             return
     
-    # Add probing-specific settings to config
-    probing_config = {
-        "probing": {
-            "targets": args.targets.split(","),
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "visualize": args.visualize
-        }
-    }
-    config = merge_configs(config, probing_config)
+    # Create a probing config
+    probing_config = ProbingConfig(
+        lr=args.lr,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        probe_dynamics=args.probe_dynamics,
+        probe_reward=args.probe_reward,
+        probe_encoder=args.probe_encoder,
+        probe_predictor=args.probe_predictor,
+        visualize=args.visualize,
+        save_weights=args.save_weights,
+        save_visualizations=args.save_visualizations,
+        max_vis_samples=args.max_vis_samples,
+        use_wandb=args.use_wandb
+    )
     
     # Initialize WandB logging if requested
     wandb_run = None
@@ -745,7 +938,7 @@ def main():
             import wandb
             wandb_run = wandb.init(
                 project=args.wandb_project,
-                config=config
+                config={**config, **vars(args)}
             )
             logger.info(f"WandB initialized: {wandb_run.name} ({wandb_run.url})")
         except ImportError:
@@ -757,7 +950,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
-    # Load trained model
+    # Load trained models
     try:
         # Initialize trainer with the saved models
         trainer = PLDMTrainer(
@@ -766,7 +959,8 @@ def main():
             model_type=config["model"]["type"],
             batch_size=config["training"]["batch_size"],
             device=device,
-            wandb_run=wandb_run
+            wandb_run=wandb_run,
+            config=config
         )
         
         # Load saved models
@@ -780,19 +974,19 @@ def main():
             wandb_run.finish(exit_code=1)
         return
     
-    # Initialize prober evaluator
-    prober_evaluator = ProberEvaluator(
-        pldm_trainer=trainer,
+    # Initialize probing evaluator
+    prober_evaluator = ProbingEvaluator(
+        model=trainer,
         output_dir=args.output_dir,
-        config=config["probing"],
+        config=probing_config,
         device=device,
         wandb_run=wandb_run
     )
     
     # Train and evaluate probers
     try:
-        results = prober_evaluator.train_all_probers()
-        logger.info("Probing completed successfully")
+        results = prober_evaluator.train_probers_for_all_channels()
+        logger.info("Channel probing completed successfully")
     except Exception as e:
         logger.error(f"Error during probing: {e}")
         if wandb_run:

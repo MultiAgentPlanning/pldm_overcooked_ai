@@ -184,3 +184,5 @@ __pycache__
 wandb
 d3rlpy_logs/
 data/
+models/
+random_search

@@ -2,9 +2,9 @@ seed: 101
 workflow:
   run_training: true
   run_probing: true
-  run_planning: true
+  run_planning: false
 data:
-  train_data_path: /home/km6748/pldm_overcooked_ai/data/raw/2020_hh_trials.csv
+  train_data_path: /scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv
   val_data_path: null
   test_data_path: null
   val_ratio: 0.1
@@ -24,7 +24,7 @@ model:
   grid_dims:
     H: 5
     W: 5
-  in_channels: 26
+  in_channels: 32
   num_objects: 17
   hidden_channels:
   - 16
@@ -34,10 +34,10 @@ model:
   - 256
   - 128
   dynamics_predictor:
-    predictor_type: grid
+    predictor_type: transformer
     hidden_size: 128
     num_layers: 3
-    dropout: 0.0
+    dropout: 0.15
     activation: relu
     nhead: 4
     num_encoder_layers: 2
@@ -47,13 +47,13 @@ model:
     predictor_type: grid
     hidden_size: 64
     num_layers: 3
-    dropout: 0.0
+    dropout: 0.15
     activation: relu
     nhead: 4
     num_encoder_layers: 2
     dim_feedforward: 512
     bidirectional: false
-  teacher_forcing_ratio: 0.5
+  teacher_forcing_ratio: 0
   reward_hidden_dims:
   - 128
   - 64
@@ -68,7 +68,7 @@ model:
   use_layer_norm: false
   device: cuda
 loss:
-  dynamics_loss: mse
+  dynamics_loss: vicreg
   reward_loss: mse
   vicreg:
     projector_layers:
@@ -76,21 +76,21 @@ loss:
     - 2048
     - 2048
     output_dim: 256
-    sim_coeff: 25.0
-    std_coeff: 25.0
-    cov_coeff: 1.0
+    sim_coeff: 1.0
+    std_coeff: 4.0
+    cov_coeff: 7
     std_margin: 1.0
     projector_type: identity
-    sim_coeff_t: 10.0
+    sim_coeff_t: 1.0
     std_coeff_t: 5.0
-    cov_coeff_t: 0.5
+    cov_coeff_t: 0
     std_margin_t: 1.0
     adjust_cov: true
 training:
   output_dir: models/pldm
   batch_size: 128
-  dynamics_epochs: 10
-  reward_epochs: 5
+  dynamics_epochs: 100
+  reward_epochs: 1
   learning_rate: 0.001
   log_interval: 10
   num_workers: 4
@@ -104,10 +104,12 @@ training:
   max_norm: 1.0
   use_layer_norm: false
   seed: 42
+  train_dynamics: true
+  train_reward: true
 testing:
-  num_samples: 100
+  num_samples: 1
   planning_horizon: 5
-  planning_samples: 100
+  planning_samples: 1
   batch_size: 128
   use_val_data: false
   use_test_data: true
@@ -121,16 +123,32 @@ wandb:
 probing:
   targets:
   - agent_pos
+  - reward
   probe_dynamics: true
   probe_reward: false
   batch_size: 64
-  epochs: 20
-  lr: 0.001
+  epochs: 30
+  lr: 0.0001
   val_ratio: 0.1
   test_ratio: 0.1
-  visualize: true
+  visualize: false
   max_vis_samples: 10
-  hidden_dims:
-  - 128
-  - 64
-  activation: relu
+  probe_encoder: true
+  probe_predictor: true
+  state_channels:
+    arch: mlp
+    hidden_dims:
+    - 128
+    - 64
+  agent_pos:
+    arch: mlp
+    hidden_dims:
+    - 128
+    - 64
+  reward:
+    arch: mlp
+    hidden_dims:
+    - 64
+    - 32
+  save_weights: true
+  save_visualizations: true

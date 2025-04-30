@@ -185,6 +185,40 @@ class OvercookedDataset(Dataset):
                         next_state_dict = parse_state(next_row['state'])
                         reward = float(curr_row['reward'])
                         
+                        # Ensure timestep is in the state_dict
+                        if 'extracted_timestep' in curr_row:
+                            curr_state_dict['timestep'] = curr_row['extracted_timestep']
+                        elif 'cur_gameloop' in curr_row:
+                            curr_state_dict['timestep'] = curr_row['cur_gameloop']
+                        else:
+                            # If no explicit timestep, use the row index within the trial
+                            curr_state_dict['timestep'] = i
+                        
+                        # Ensure timestep is in the next_state_dict
+                        if 'extracted_timestep' in next_row:
+                            next_state_dict['timestep'] = next_row['extracted_timestep']
+                        elif 'cur_gameloop' in next_row:
+                            next_state_dict['timestep'] = next_row['cur_gameloop']
+                        else:
+                            # If no explicit timestep, use the row index within the trial
+                            next_state_dict['timestep'] = i + 1
+                        
+                        # Parse layout data if available
+                        if 'layout' in curr_row and curr_row['layout']:
+                            try:
+                                layout = parse_layout(curr_row['layout'])
+                                curr_state_dict['layout'] = layout
+                            except Exception as layout_error:
+                                logger.warning(f"Error parsing layout in trial {trial_id}, row {i}: {layout_error}")
+                        
+                        # Parse layout data for next state if available
+                        if 'layout' in next_row and next_row['layout']:
+                            try:
+                                layout = parse_layout(next_row['layout'])
+                                next_state_dict['layout'] = layout
+                            except Exception as layout_error:
+                                logger.warning(f"Error parsing layout in trial {trial_id}, row {i+1}: {layout_error}")
+                        
                         action_indices = [
                             get_action_index(joint_action[0]),
                             get_action_index(joint_action[1])
