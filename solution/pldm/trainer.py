@@ -882,16 +882,39 @@ class PLDMTrainer:
             reward_epochs: Number of epochs to train reward model
             log_interval: Interval for logging
         """
-        logger.info("Starting training for both dynamics and reward models.")
+        # Check training flags from config
+        config_train_dynamics = self.config.get("training", {}).get("train_dynamics", True)
+        config_train_reward = self.config.get("training", {}).get("train_reward", True)
         
-        # Train dynamics model
-        self.train_dynamics(num_epochs=dynamics_epochs, log_interval=log_interval)
+        logger.info("Starting model training phase.")
+        logger.info(f"Training dynamics model: {'ENABLED' if config_train_dynamics else 'DISABLED'}")
+        logger.info(f"Training reward model: {'ENABLED' if config_train_reward else 'DISABLED'}")
         
-        # Train reward model
-        self.train_reward(num_epochs=reward_epochs, log_interval=log_interval)
+        # Train dynamics model if enabled
+        if config_train_dynamics:
+            self.train_dynamics(num_epochs=dynamics_epochs, log_interval=log_interval)
+        else:
+            logger.info("Skipping dynamics model training as per configuration.")
+            
+        # Train reward model if enabled
+        if config_train_reward:
+            self.train_reward(num_epochs=reward_epochs, log_interval=log_interval)
+        else:
+            logger.info("Skipping reward model training as per configuration.")
         
         # Evaluate on test set after training
-        logger.info("Evaluating final models on test set...")
-        test_metrics = self.evaluate_test_set(model_type='both')
+        dynamics_trained = config_train_dynamics
+        reward_trained = config_train_reward
         
-        logger.info("Finished training both models.") 
+        if dynamics_trained or reward_trained:
+            logger.info("Evaluating final models on test set...")
+            if dynamics_trained and reward_trained:
+                model_type = 'both'
+            elif dynamics_trained:
+                model_type = 'dynamics'
+            else:
+                model_type = 'reward'
+            
+            test_metrics = self.evaluate_test_set(model_type=model_type)
+        
+        logger.info("Training phase complete.") 

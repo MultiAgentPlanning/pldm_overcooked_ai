@@ -44,12 +44,15 @@ class GridStateEncoder:
             "pot_empty": 22,
             "pot_cooking": 23,
             "pot_ready": 24,
+            # Layout elements
             "wall": 25,
             "counter": 26,
             "onion_dispenser": 27,
             "tomato_dispenser": 28,
             "dish_dispenser": 29,
-            "serving_location": 30
+            "serving_location": 30,
+            # Time information
+            "timestep": 31
         }
         
         # Total number of channels
@@ -70,6 +73,30 @@ class GridStateEncoder:
             (0, -1): "left",  # Left
             (0, 1): "right"   # Right
         }
+        
+        # Dictionary for layout element mapping
+        self.layout_elements = {
+            'X': 'wall',
+            'P': 'pot',
+            'O': 'onion_dispenser',
+            'T': 'tomato_dispenser',
+            'D': 'dish_dispenser',
+            'S': 'serving_location',
+            ' ': 'counter'
+        }
+        
+        # Mapping from layout element to channel index
+        self.layout_element_to_channel = {
+            'wall': self.channels["wall"],
+            'counter': self.channels["counter"],
+            'onion_dispenser': self.channels["onion_dispenser"],
+            'tomato_dispenser': self.channels["tomato_dispenser"],
+            'dish_dispenser': self.channels["dish_dispenser"],
+            'serving_location': self.channels["serving_location"]
+        }
+        
+        # Maximum timestep for normalization (can be adjusted based on data)
+        self.max_timestep = 400  # checked this in csv.
     
     def _initialize_grid_size(self, state_dict: Dict):
         """
@@ -94,6 +121,13 @@ class GridStateEncoder:
                 row, col = obj["position"]
                 max_row = max(max_row, row)
                 max_col = max(max_col, col)
+        
+        # Check layout dimensions if available
+        if "layout" in state_dict:
+            layout = state_dict["layout"]
+            max_row = max(max_row, len(layout) - 1)
+            if layout and len(layout) > 0:
+                max_col = max(max_col, len(layout[0]) - 1)
         
         # Set grid dimensions with margin
         self.grid_height = max_row + 2  # Add margin
@@ -131,8 +165,33 @@ class GridStateEncoder:
                     self.grid_height = max(self.grid_height, row + 1)
                     self.grid_width = max(self.grid_width, col + 1)
         
+        # Check layout dimensions if available
+        if "layout" in state_dict:
+            layout = state_dict["layout"]
+            if layout and len(layout) > 0:
+                if len(layout) > self.grid_height or len(layout[0]) > self.grid_width:
+                    self.grid_height = max(self.grid_height, len(layout))
+                    self.grid_width = max(self.grid_width, len(layout[0]))
+        
         # Initialize grid with zeros
         grid = np.zeros((self.num_channels, self.grid_height, self.grid_width))
+        
+        # Add timestep information (normalized between 0 and 1)
+        timestep = state_dict.get("timestep", 0)
+        normalized_timestep = min(timestep / self.max_timestep, 1.0)  # Cap at 1.0
+        
+        # Fill the entire timestep channel with the normalized value
+        grid[self.channels["timestep"]] = normalized_timestep
+        
+        # Encode layout if available
+        if "layout" in state_dict:
+            layout = state_dict["layout"]
+            for i, row in enumerate(layout):
+                for j, cell in enumerate(row):
+                    if cell in self.layout_elements:
+                        element_name = self.layout_elements[cell]
+                        if element_name in self.layout_element_to_channel:
+                            grid[self.layout_element_to_channel[element_name], i, j] = 1
         
         # Encode players (agents)
         for player_idx, player in enumerate(state_dict["players"]):
@@ -193,7 +252,7 @@ class StateEncoderNetwork(nn.Module):
     Takes a grid-based state representation and embeds it into a latent vector.
     """
     def __init__(self, 
-                 input_channels: int = 31, 
+                 input_channels: int = 32, 
                  state_embed_dim: int = 128,
                  grid_height: int = None,
                  grid_width: int = None):
@@ -275,6 +334,20 @@ class VectorStateEncoder:
             (0, -1): 2,  # Left
             (0, 1): 3    # Right
         }
+        
+        # Dictionary for layout element mapping
+        self.layout_elements = {
+            'X': 'wall',
+            'P': 'pot',
+            'O': 'onion_dispenser',
+            'T': 'tomato_dispenser',
+            'D': 'dish_dispenser',
+            'S': 'serving_location',
+            ' ': 'counter'
+        }
+        
+        # Maximum timestep for normalization (can be adjusted based on data)
+        self.max_timestep = 600  # Typical episode length in Overcooked
     
     def _initialize_grid_size(self, state_dict: Dict):
         """
@@ -300,6 +373,13 @@ class VectorStateEncoder:
                 max_row = max(max_row, row)
                 max_col = max(max_col, col)
         
+        # Check layout dimensions if available
+        if "layout" in state_dict:
+            layout = state_dict["layout"]
+            max_row = max(max_row, len(layout) - 1)
+            if layout and len(layout) > 0:
+                max_col = max(max_col, len(layout[0]) - 1)
+        
         # Set grid dimensions with margin
         self.grid_height = max_row + 2  # Add margin
         self.grid_width = max_col + 2   # Add margin
@@ -322,6 +402,11 @@ class VectorStateEncoder:
         
         # Initialize vectors for agents
         features = []
+        
+        # Add timestep information (normalized between 0 and 1)
+        timestep = state_dict.get("timestep", 0)
+        normalized_timestep = min(timestep / self.max_timestep, 1.0)  # Cap at 1.0
+        features.append(normalized_timestep)
         
         # Encode agents
         for player in state_dict["players"]:
@@ -369,6 +454,20 @@ class VectorStateEncoder:
         features.extend(list(obj_counts.values()))
         # Add pot states to features
         features.extend(list(pot_states.values()))
+        
+        # Encode layout information if available (summarized)
+        layout_counts = {element: 0 for element in self.layout_elements.values()}
+        
+        if "layout" in state_dict:
+            layout = state_dict["layout"]
+            for row in layout:
+                for cell in row:
+                    if cell in self.layout_elements:
+                        element = self.layout_elements[cell]
+                        layout_counts[element] += 1
+        
+        # Add layout counts to features
+        features.extend(list(layout_counts.values()))
         
         return np.array(features, dtype=np.float32)
 

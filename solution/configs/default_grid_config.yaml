@@ -8,11 +8,11 @@ seed: 101  # Random seed for reproducibility
 workflow:
   run_training: true   # Enable training phase
   run_probing: true    # Enable probing phase  
-  run_planning: true   # Enable planning phase
+  run_planning: false   # Enable planning phase
 
 # Data parameters
 data:
-  train_data_path: "./data/2020_hh_trials.csv"
+  train_data_path: "/scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv"
   val_data_path: null  # Will use split from train data
   test_data_path: null  # Will use split from train data
   val_ratio: 0.1
@@ -27,17 +27,17 @@ model:
   grid_dims:
     H: 5
     W: 5
-  in_channels: 26
+  in_channels: 32
   num_objects: 17
   hidden_channels: [16, 32, 64]
   fc_dims: [256, 128]
   
   # Predictor settings
   dynamics_predictor:
-    predictor_type: "grid"  # Options: "grid", "transformer", "lstm"
+    predictor_type: "transformer"  # Options: "grid", "transformer", "lstm"
     hidden_size: 128
     num_layers: 3
-    dropout: 0.0
+    dropout: 0.15
     activation: "relu"
     # Transformer-specific parameters
     nhead: 4  # Number of attention heads (transformer only)
@@ -50,7 +50,7 @@ model:
     predictor_type: "grid"  # Options: "grid", "transformer", "lstm"
     hidden_size: 64
     num_layers: 3
-    dropout: 0.0
+    dropout: 0.15
     activation: "relu"
     # Transformer-specific parameters
     nhead: 4  # Number of attention heads (transformer only)
@@ -75,7 +75,7 @@ model:
 
 # Loss function parameters
 loss:
-  dynamics_loss: "mse"  # Options: "mse" or "vicreg"
+  dynamics_loss: "vicreg"  # Options: "mse" or "vicreg"
   reward_loss: "mse"    # Options: "mse" or "vicreg"
   
   # VICReg specific parameters (used when dynamics_loss or reward_loss is "vicreg")
@@ -83,22 +83,22 @@ loss:
     projector_type: "identity"  # Options: "mlp" or "identity"
     projector_layers: [2048, 2048, 2048]  # Projector MLP hidden dimensions (used only if projector_type is "mlp")
     output_dim: 256                      # Projector output dimension (used only if projector_type is "mlp")
-    sim_coeff: 25.0                      # Coefficient for similarity loss
-    std_coeff: 25.0                      # Coefficient for std loss
-    cov_coeff: 1.0                       # Coefficient for covariance loss
+    sim_coeff: 1.0                      # Coefficient for similarity loss
+    std_coeff: 4.0                      # Coefficient for std loss
+    cov_coeff: 7                       # Coefficient for covariance loss
     std_margin: 1.0                      # Margin for std loss
     # Temporal coefficients (if using temporal data)
-    sim_coeff_t: 10.0                    # Coefficient for temporal similarity loss
+    sim_coeff_t: 1.0                    # Coefficient for temporal similarity loss
     std_coeff_t: 5.0                     # Coefficient for temporal std loss
-    cov_coeff_t: 0.5                     # Coefficient for temporal covariance loss
+    cov_coeff_t: 0                     # Coefficient for temporal covariance loss
     std_margin_t: 1.0                    # Margin for temporal std loss
     adjust_cov: true                     # Whether to adjust covariance loss
 
 # Training parameters
 training:
   batch_size: 128
-  dynamics_epochs: 10
-  reward_epochs: 5
+  dynamics_epochs: 100
+  reward_epochs: 1
   learning_rate: 0.001
   optimizer: "adam"
   weight_decay: 0.00001
@@ -111,42 +111,59 @@ training:
   seed: 42
   log_interval: 10
   num_workers: 4
+  # Model selection for training
+  train_dynamics: true    # Whether to train the dynamics model
+  train_reward: false      # Whether to train the reward model
 
 # Testing parameters
 testing:
   batch_size: 128
   use_val_data: false
   use_test_data: true
-  num_samples: 100
+  num_samples: 1
   planning_horizon: 5
-  planning_samples: 100
+  planning_samples: 1
 
 # WandB parameters
 wandb:
   project: "pldm-overcooked"
   name: base
   entity: harshsutariya1179
-  use_wandb: true  # Disabling WandB due to SSL certificate issues
+  use_wandb: true
   watch_model: true
   save_model: true
   
 probing:
-  # Probing targets
-  targets: ["agent_pos"]
-  probe_dynamics: true
-  probe_reward: false
+  # Probe configuration
+  probe_dynamics: true    # Probe dynamics model
+  probe_reward: false     # Don't probe reward model
+  probe_encoder: true     # Probe state encoder representations
+  probe_predictor: true  # Don't probe dynamics predictor representations
   
-  # Model parameters
-  hidden_dims: [128, 64]
-  activation: "relu"
+  # State channel probing configuration
+  state_channels:
+    arch: "mlp"
+    hidden_dims: [128, 64]
+    
+  # Agent position probing configuration
+  agent_pos:
+    arch: "mlp"
+    hidden_dims: [128, 64]
+    
+  # Reward probing configuration  
+  reward:
+    arch: "mlp"
+    hidden_dims: [64, 32]
   
   # Training parameters
   batch_size: 64
-  epochs: 20
-  lr: 0.001
-  val_ratio: 0.1
-  test_ratio: 0.1
+  epochs: 100             # Number of epochs for training probers
+  lr: 0.0001             # Learning rate
   
   # Visualization settings
-  visualize: true
-  max_vis_samples: 10
+  visualize: false
+  max_vis_samples: 10    # Maximum number of samples to visualize
+  
+  # Save options
+  save_weights: false     # Whether to save prober weights to disk
+  save_visualizations: false  # Whether to save visualization images

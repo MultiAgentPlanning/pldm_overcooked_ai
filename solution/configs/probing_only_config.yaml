@@ -1,5 +1,5 @@
 # Configuration file for probing-only workflow
-# This configuration skips the training and planning phases, only running probing analysis
+# This configuration skips the training and planning phases, only running state channel probing analysis
 
 # General settings
 seed: 42  # Random seed for reproducibility
@@ -42,22 +42,37 @@ training:
 
 # Probing parameters
 probing:
-  targets: ["state", "reward", "agent_pos"]
-  probe_dynamics: true
-  probe_reward: true
-  hidden_dims: [128, 64]
-  activation: "relu"
+  # Probe configuration
+  probe_dynamics: true    # Probe dynamics model
+  probe_reward: true      # Probe reward model
+  
+  # State channel probing configuration
+  state_channels:
+    arch: "mlp"
+    hidden_dims: [128, 64]
+    
+  # Agent position probing configuration
+  agent_pos:
+    arch: "mlp"
+    hidden_dims: [128, 64]
+    
+  # Reward probing configuration  
+  reward:
+    arch: "mlp"
+    hidden_dims: [64, 32]
+  
+  # Training parameters
   batch_size: 64
-  epochs: 15  # Increase epochs for more thorough probing
-  lr: 0.001
-  val_ratio: 0.1
-  test_ratio: 0.1
+  epochs: 30             # Number of epochs for training probers
+  lr: 0.001              # Learning rate
+  
+  # Visualization settings
   visualize: true
-  max_vis_samples: 20
+  max_vis_samples: 10    # Maximum number of samples to visualize
 
 # WandB parameters
 wandb:
   use_wandb: true
-  project: "pldm-probing"
-  name: "probing_only_analysis"
+  project: "pldm-channel-probing"
+  name: "state_channel_probing"
   entity: null 

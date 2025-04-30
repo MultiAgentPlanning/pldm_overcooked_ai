@@ -256,6 +256,9 @@ class TransformerPredictor(BasePredictor):
         # Project input to transformer dimension
         self.input_proj = nn.Linear(input_dim, hidden_size)
         
+        # Separate projection for action embeddings
+        self.action_proj = nn.Linear(action_embed_dim, hidden_size)
+        
         # Transformer encoder
         encoder_layers = nn.TransformerEncoderLayer(
             d_model=hidden_size, 
@@ -293,9 +296,16 @@ class TransformerPredictor(BasePredictor):
         """
         batch_size = state.shape[0]
         
-        # If only the embedding is requested, return it
-        if return_embedding:
-            return state
+        # Handle grid state by flattening it if needed
+        if len(state.shape) > 2:  # For grid-based input (batch_size, channels, height, width)
+            # Save original dimensions for reshaping the output later
+            self.original_shape = state.shape
+            # Flatten the grid dimensions
+            state = state.view(batch_size, -1)
+            
+            # Also flatten target_state if provided and has more than 2 dimensions
+            if target_state is not None and len(target_state.shape) > 2:
+                target_state = target_state.view(batch_size, -1)
         
         # Project state to transformer dimension
         state_embed = self.input_proj(state)
@@ -304,8 +314,8 @@ class TransformerPredictor(BasePredictor):
         action_embeds = []
         for i in range(action_indices.shape[1]):  # For each agent
             action_embed = self.action_embedding(action_indices[:, i])
-            # Project to transformer dimension
-            action_embed = self.input_proj(action_embed)
+            # Project to transformer dimension using action projection
+            action_embed = self.action_proj(action_embed)
             action_embeds.append(action_embed)
         
         # Determine if we should use teacher forcing
@@ -336,8 +346,17 @@ class TransformerPredictor(BasePredictor):
             # Return scalar reward
             return self.output_proj(final_output)
         else:
-            # For dynamics, return embedding
-            return self.output_proj(final_output)
+            # For dynamics, get the output
+            output = self.output_proj(final_output)
+            
+            # Reshape back to grid form if the input was a grid
+            if hasattr(self, 'original_shape') and len(self.original_shape) > 2:
+                output = output.view(batch_size, *self.original_shape[1:])
+                
+            if return_embedding:
+                output = output.view(batch_size, -1)
+                
+            return output
 
 
 class LSTMPredictor(BasePredictor):
@@ -494,7 +513,7 @@ def create_dynamics_predictor(config: Dict[str, Any], input_dim: int, output_dim
     if predictor_type.lower() == "grid" and "grid_params" in config:
         grid_params = config.get("grid_params", {})
         params.update({
-            "channels": grid_params.get("num_channels", 31),
+            "channels": grid_params.get("num_channels", 32),
             "height": grid_params.get("grid_height", 5),
             "width": grid_params.get("grid_width", 13)
         })
@@ -530,7 +549,7 @@ def create_reward_predictor(config: Dict[str, Any], input_dim: int):
     if predictor_type.lower() == "grid" and "grid_params" in config:
         grid_params = config.get("grid_params", {})
         params.update({
-            "channels": grid_params.get("num_channels", 31),
+            "channels": grid_params.get("num_channels", 32),
             "height": grid_params.get("grid_height", 5),
             "width": grid_params.get("grid_width", 13)
         })

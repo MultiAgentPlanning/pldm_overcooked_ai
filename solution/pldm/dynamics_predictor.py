@@ -48,7 +48,7 @@ class GridDynamicsPredictor(nn.Module):
                  action_embed_dim: int = 4,
                  num_actions: int = 6,
                  hidden_dim: int = 256,
-                 num_channels: int = 31,
+                 num_channels: int = 32,
                  grid_height: int = 5,
                  grid_width: int = 13):
         super().__init__()
