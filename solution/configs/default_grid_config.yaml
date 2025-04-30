@@ -65,7 +65,7 @@ model:
   teacher_forcing_ratio: 0  # Probability of using teacher forcing during training (0.0 to 1.0) #only for transformer predictor
   
   # reward predictor params
-  reward_hidden_dims: [128, 64, 32]
+  reward_hidden_dims: [136, 64, 32]     #128(encoder) + 8(reward)
   reward_activation: "relu"
   # dynamics predictor params
   dynamics_hidden_dims: [128, 64, 32]
@@ -159,7 +159,7 @@ probing:
   
   # Training parameters
   batch_size: 64
-  epochs: 30             # Number of epochs for training probers
+  epochs: 20             # Number of epochs for training probers
   lr: 0.001             # Learning rate
   
   # Visualization settings
