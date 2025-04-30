@@ -775,6 +775,7 @@ class ProbingEvaluator:
         """
         # Create a summary table
         summary = []
+        total_test_loss = 0.0
         
         for (model_type, repr_type, channel_name), metrics in results.items():
             summary.append({
@@ -783,6 +784,7 @@ class ProbingEvaluator:
                 'Channel': channel_name,
                 'MSE': metrics['mean_loss'],
             })
+            total_test_loss += metrics['mean_loss']
         
         # Sort by model type, representation type, then channel
         summary.sort(key=lambda x: (x['Model'], x['ReprType'], x['Channel']))
@@ -798,6 +800,10 @@ class ProbingEvaluator:
                 f"{row['Model']:<10} {row['ReprType']:<10} {row['Channel']:<25} "
                 f"{row['MSE']:<10.6f}"
             )
+            
+        # Log and print total test loss
+        logger.info("-" * 57)
+        logger.info(f"{'Total Test Loss:':<47} {total_test_loss:<10.6f}")
         
         # Save summary to JSON
         summary_path = self.output_dir / "probing_summary.json"
@@ -821,6 +827,8 @@ class ProbingEvaluator:
                 )
             
             self.wandb_run.log({"probing_summary": wandb_table})
+            # Log total test loss to WandB
+            self.wandb_run.log({"total_test_loss": total_test_loss})
             
         # Create comparative visualizations
         self.visualize_comparative_results(summary)

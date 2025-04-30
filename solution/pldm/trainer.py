@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import logging # Import logging
 from tqdm import tqdm # Import tqdm
 import inspect
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR, CosineAnnealingLR, SequentialLR # Updated imports
 
 # Attempt to import wandb, but don't fail if it's not installed
 try:
@@ -160,7 +161,9 @@ class PLDMTrainer:
         self.dynamics_model = None
         self.reward_model = None
         self.dynamics_optimizer = None
+        self.dynamics_scheduler = None # Initialize scheduler attribute to None
         self.reward_optimizer = None
+        self.reward_scheduler = None # Initialize scheduler attribute to None
         
         # Load and prepare data if path is provided
         if data_path:
@@ -387,33 +390,92 @@ class PLDMTrainer:
 
 
     def _initialize_optimizers(self):
-        """Initialize optimizers for the models."""
+        """Initialize optimizers for the models. Scheduler initialization moved to train_* methods."""
+        logger.info("Initializing optimizers...")
+        training_config = self.config.get("training", {})
+        optimizer_type = training_config.get("optimizer", "adam")
+        weight_decay = training_config.get("weight_decay", 0.0)
+        learning_rate = training_config.get("learning_rate", self.lr) # Use config LR if available
+
         if self.dynamics_model:
-            self.dynamics_optimizer = self._create_optimizer(self.dynamics_model)
-            logger.info(f"Initialized dynamics optimizer: {self.config.get('optimizer', 'adam')}")
+            self.dynamics_optimizer = self._create_optimizer(self.dynamics_model, optimizer_type, learning_rate, weight_decay)
+            logger.info(f"Initialized dynamics optimizer: {optimizer_type}")
+            # self.dynamics_scheduler is initialized in train_dynamics
+
         if self.reward_model:
-            self.reward_optimizer = self._create_optimizer(self.reward_model)
-            logger.info(f"Initialized reward optimizer: {self.config.get('optimizer', 'adam')}")
+            self.reward_optimizer = self._create_optimizer(self.reward_model, optimizer_type, learning_rate, weight_decay)
+            logger.info(f"Initialized reward optimizer: {optimizer_type}")
+            # self.reward_scheduler is initialized in train_reward
+
         # Add CNN encoder parameters if it exists and is trainable
-        if self.cnn_encoder and self.config.get("training", {}).get("train_dynamics", True): # Assuming CNN trained with dynamics
-             # Create a separate optimizer or add params to dynamics optimizer?
-             # Adding to dynamics optimizer for simplicity
-             logger.info("Adding CNN encoder parameters to dynamics optimizer.")
-             self.dynamics_optimizer.add_param_group({'params': self.cnn_encoder.parameters()})
+        if self.cnn_encoder and self.dynamics_optimizer and training_config.get("train_dynamics", True):
+            logger.info("Adding CNN encoder parameters to dynamics optimizer.")
+            self.dynamics_optimizer.add_param_group({'params': self.cnn_encoder.parameters(), 'lr': learning_rate}) # Ensure LR is passed
 
 
-    def _create_optimizer(self, model):
+    def _create_optimizer(self, model, optimizer_type, lr, weight_decay):
         """Helper function to create an optimizer instance."""
-        optimizer_type = self.config.get("optimizer", "adam").lower()
+        optimizer_type = optimizer_type.lower()
         if optimizer_type == "adam":
-            return optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            return optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         elif optimizer_type == "adamw":
-             return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+             return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         elif optimizer_type == "sgd":
-            return optim.SGD(model.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
+            return optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
         else:
             logger.warning(f"Unsupported optimizer type: {optimizer_type}. Defaulting to Adam.")
-            return optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            return optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    def _create_scheduler(self, optimizer, training_config, total_epochs):
+        """Helper function to create a learning rate scheduler instance based on config and total epochs."""
+        scheduler_type = training_config.get("scheduler", "none").lower()
+        scheduler = None
+
+        if scheduler_type == "plateau":
+            patience = training_config.get("scheduler_patience", 10)
+            factor = training_config.get("scheduler_factor", 0.5)
+            min_lr = training_config.get("scheduler_min_lr", 1e-6)
+            scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=factor, patience=patience, min_lr=min_lr, verbose=True)
+            logger.info(f"Initialized ReduceLROnPlateau scheduler (patience={patience}, factor={factor}, min_lr={min_lr})")
+
+        elif scheduler_type == "cosine_warmup":
+            warmup_epochs = training_config.get("warmup_epochs", 5)
+            # T_max should be total epochs - warmup epochs for CosineAnnealingLR part
+            # Use config T_max only if explicitly provided, otherwise calculate it
+            config_T_max = training_config.get("cosine_T_max")
+            if config_T_max is not None:
+                 actual_T_max = int(config_T_max)
+                 logger.warning(f"Using explicitly set cosine_T_max={actual_T_max}. Ensure it matches training duration.")
+            else:
+                 actual_T_max = max(1, total_epochs - warmup_epochs) # Ensure T_max is at least 1
+
+            eta_min = training_config.get("cosine_eta_min", 1e-6)
+
+            if warmup_epochs >= total_epochs:
+                 logger.warning(f"Warmup epochs ({warmup_epochs}) >= total epochs ({total_epochs}). Using only linear warmup.")
+                 # Simple linear warmup for the whole duration
+                 warmup_lr_lambda = lambda epoch: float(epoch + 1) / total_epochs
+                 scheduler = LambdaLR(optimizer, lr_lambda=warmup_lr_lambda)
+            elif warmup_epochs > 0:
+                 # Linear warmup phase
+                 warmup_lr_lambda = lambda epoch: float(epoch) / warmup_epochs
+                 warmup_scheduler = LambdaLR(optimizer, lr_lambda=warmup_lr_lambda)
+
+                 # Cosine annealing phase
+                 cosine_scheduler = CosineAnnealingLR(optimizer, T_max=actual_T_max, eta_min=eta_min)
+
+                 # Combine them sequentially
+                 scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+                 logger.info(f"Initialized CosineAnnealingLR scheduler with Linear Warmup (warmup={warmup_epochs}, T_max={actual_T_max}, eta_min={eta_min})")
+            else: # No warmup, just cosine annealing
+                 cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=eta_min)
+                 scheduler = cosine_scheduler
+                 logger.info(f"Initialized CosineAnnealingLR scheduler (T_max={total_epochs}, eta_min={eta_min})")
+
+        elif scheduler_type != "none":
+            logger.warning(f"Unsupported scheduler type: {scheduler_type}. No scheduler will be used.")
+
+        return scheduler
 
 
     def _initialize_loss_functions(self):
@@ -578,6 +640,16 @@ class PLDMTrainer:
             logger.error(f"Error during backward pass or optimizer step for {model_type}: {e}", exc_info=True)
             raise
 
+        # Step the scheduler if it exists and is step-based (not Plateau)
+        scheduler = self.dynamics_scheduler if model_type == 'dynamics' else self.reward_scheduler
+        if scheduler is not None and not isinstance(scheduler, ReduceLROnPlateau):
+            # Non-plateau schedulers (like SequentialLR, CosineAnnealing) are typically stepped each batch/iteration
+            try: # Add try-except for scheduler step
+                # scheduler.step() # Step per batch - uncomment if desired, but usually per epoch is standard
+                pass # Defaulting to epoch-based step for SequentialLR/Cosine
+            except Exception as sch_e:
+                 logger.error(f"Error stepping batch-based scheduler for {model_type}: {sch_e}", exc_info=True)
+
         # --- Logging ---
         loss_val = loss.item()
         if batch_idx % log_interval == 0:
@@ -610,6 +682,9 @@ class PLDMTrainer:
             Dictionary of training metrics.
         """
         epochs = epochs if epochs is not None else self.config.get("training", {}).get("dynamics_epochs", 10)
+        training_config = self.config.get("training", {}) # Get training config
+        log_interval = training_config.get("log_interval", 10) # Use config log_interval
+
         logger.info(f"Training dynamics model for {epochs} epochs...")
 
         if self.dynamics_model is None or self.dynamics_optimizer is None or self.dynamics_criterion is None:
@@ -624,6 +699,9 @@ class PLDMTrainer:
         train_losses = []
         val_losses = []
         metrics = {}
+
+        # Initialize the scheduler here, based on the total epochs for this model
+        self.dynamics_scheduler = self._create_scheduler(self.dynamics_optimizer, training_config, epochs)
 
         # Track when training starts for benchmarking
         start_time = time.time()
@@ -683,6 +761,16 @@ class PLDMTrainer:
                 if self.wandb_run:
                      self.wandb_run.summary["best_dynamics_val_loss"] = best_val_loss
 
+            # Step the scheduler based on its type
+            if self.dynamics_scheduler is not None:
+                try:
+                    if isinstance(self.dynamics_scheduler, ReduceLROnPlateau):
+                         self.dynamics_scheduler.step(avg_val_loss) # Step plateau scheduler with validation loss
+                    else:
+                         self.dynamics_scheduler.step() # Step other schedulers (like SequentialLR) per epoch
+                except Exception as sch_e:
+                     logger.error(f"Error stepping dynamics scheduler: {sch_e}", exc_info=True)
+
         end_time = time.time()
         total_duration = end_time - start_time
         logger.info(f"Finished training dynamics model. Total time: {total_duration:.2f}s")
@@ -708,6 +796,9 @@ class PLDMTrainer:
             Dictionary of training metrics.
         """
         epochs = epochs if epochs is not None else self.config.get("training", {}).get("reward_epochs", 10)
+        training_config = self.config.get("training", {}) # Get training config
+        log_interval = training_config.get("log_interval", 10) # Use config log_interval
+
         logger.info(f"Training reward model for {epochs} epochs...")
 
         if self.reward_model is None or self.reward_optimizer is None or self.reward_criterion is None:
@@ -722,6 +813,9 @@ class PLDMTrainer:
         train_losses = []
         val_losses = []
         metrics = {}
+
+        # Initialize the scheduler here, based on the total epochs for this model
+        self.reward_scheduler = self._create_scheduler(self.reward_optimizer, training_config, epochs)
 
         start_time = time.time()
 
@@ -761,7 +855,7 @@ class PLDMTrainer:
                     "Reward/Train_Loss_Epoch": avg_train_loss,
                     "Reward/Val_Loss_Epoch": avg_val_loss,
                     "Reward/Epoch_Time": epoch_duration,
-                    "Reward/LR": self.reward_optimizer.param_groups[0]['lr']
+                    "Reward/LR": self.reward_optimizer.param_groups[0]['lr'] # Log learning rate
                 }
                 self.wandb_run.log(log_epoch_data)
 
@@ -774,6 +868,15 @@ class PLDMTrainer:
                 if self.wandb_run:
                      self.wandb_run.summary["best_reward_val_loss"] = best_val_loss
 
+            # Step the scheduler based on its type
+            if self.reward_scheduler is not None:
+                try:
+                    if isinstance(self.reward_scheduler, ReduceLROnPlateau):
+                        self.reward_scheduler.step(avg_val_loss) # Step plateau scheduler with validation loss
+                    else:
+                        self.reward_scheduler.step() # Step other schedulers (like SequentialLR) per epoch
+                except Exception as sch_e:
+                    logger.error(f"Error stepping reward scheduler: {sch_e}", exc_info=True)
 
         end_time = time.time()
         total_duration = end_time - start_time

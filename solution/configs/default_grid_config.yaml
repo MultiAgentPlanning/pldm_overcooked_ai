@@ -104,10 +104,17 @@ training:
   learning_rate: 0.001
   optimizer: "adam"
   weight_decay: 0.00001
-  scheduler: "plateau"
-  scheduler_patience: 10
-  scheduler_factor: 0.5
-  scheduler_min_lr: 0.000001
+
+  # scheduler: "plateau"
+  # scheduler_patience: 10
+  # scheduler_factor: 0.5
+  # scheduler_min_lr: 0.000001
+
+  scheduler: "cosine_warmup"
+  # Cosine Annealing with Warmup settings
+  warmup_epochs: 10          # Number of epochs for linear warmup
+  cosine_T_max: 100         # T_max for CosineAnnealingLR (typically total epochs minus warmup)
+  cosine_eta_min: 0.000001  # Minimum learning rate for CosineAnnealingLR
   max_norm: 1.0
   use_layer_norm: false
   seed: 42
