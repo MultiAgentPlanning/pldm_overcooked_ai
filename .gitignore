@@ -188,3 +188,4 @@ random_search
 2019_hh_trials.csv
 2020_samples.csv
 cleaned_2019_hh_trials.csv
+!data/output_dir
