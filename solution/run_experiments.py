@@ -52,7 +52,7 @@ def main(args):
 
     # In the main function, right after creating the planner
     # Set up CSV logging
-    csv_filename = os.path.join(args.output_dir, "simulation_log.csv")
+    csv_filename = os.path.join(args.output_dir, "simulation_log_2020.csv")
     os.makedirs(args.output_dir, exist_ok=True)
     csv_headers = [
         "sample_idx",
@@ -74,7 +74,7 @@ def main(args):
             writer.writeheader()
 
     # Reading start states
-    df = pd.read_csv("sampled_unique_states_100.csv")
+    df = pd.read_csv("2020_samples_unique_100.csv")
     # ---- seeding ----
     d3rlpy.seed(args.seed)
     np.random.seed(args.seed)
