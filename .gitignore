@@ -175,7 +175,6 @@ cython_debug/
 
 # what we have added:
 *.zip
-*.csv
 *.npz
 .empty
 __pycache__
@@ -186,3 +185,6 @@ d3rlpy_logs/
 data/
 models/
 random_search
+2019_hh_trials.csv
+2020_samples.csv
+cleaned_2019_hh_trials.csv

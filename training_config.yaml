@@ -1,0 +1,155 @@
+seed: 101
+workflow:
+  run_training: true
+  run_probing: true
+  run_planning: false
+  output_dir: /scratch/hs5580/ddrl/overcooked/models/random_search/run_50
+data:
+  train_data_path: /scratch/hs5580/ddrl/overcooked/data/2020_hh_trials.csv
+  val_data_path: null
+  test_data_path: null
+  val_ratio: 0.1
+  test_ratio: 0.1
+  max_samples: null
+  grid_size: 5
+model:
+  type: grid
+  state_embed_dim: 128
+  action_embed_dim: 4
+  num_actions: 6
+  dynamics_hidden_dim: 128
+  reward_hidden_dim: 64
+  grid_height: null
+  grid_width: null
+  encoder_type: cnn
+  grid_dims:
+    H: 5
+    W: 5
+  in_channels: 32
+  num_objects: 17
+  hidden_channels:
+  - 16
+  - 32
+  - 64
+  fc_dims:
+  - 256
+  - 128
+  dynamics_predictor:
+    predictor_type: transformer
+    hidden_size: 128
+    num_layers: 5
+    dropout: 0.15
+    activation: relu
+    nhead: 4
+    num_encoder_layers: 1
+    dim_feedforward: 256
+    bidirectional: false
+  reward_predictor:
+    predictor_type: grid
+    hidden_size: 64
+    num_layers: 5
+    dropout: 0.15
+    activation: relu
+    nhead: 4
+    num_encoder_layers: 1
+    dim_feedforward: 256
+    bidirectional: false
+  teacher_forcing_ratio: 0
+  reward_hidden_dims:
+  - 136
+  - 64
+  - 32
+  reward_activation: relu
+  dynamics_hidden_dims:
+  - 128
+  - 64
+  - 32
+  dynamics_activation: relu
+  activation: relu
+  use_layer_norm: false
+  device: cuda
+loss:
+  dynamics_loss: vicreg
+  reward_loss: mse
+  vicreg:
+    projector_layers:
+    - 2048
+    - 2048
+    - 2048
+    output_dim: 256
+    sim_coeff: 4.9132
+    std_coeff: 8.04
+    cov_coeff: 7.06
+    std_margin: 1.0
+    projector_type: identity
+    sim_coeff_t: 4.5153
+    std_coeff_t: 4.7312
+    cov_coeff_t: 0
+    std_margin_t: 1.0
+    adjust_cov: true
+training:
+  output_dir: /scratch/hs5580/ddrl/overcooked/models/random_search/run_50
+  batch_size: 128
+  dynamics_epochs: 100
+  reward_epochs: 1
+  learning_rate: 0.0046
+  log_interval: 10
+  num_workers: 4
+  device: auto
+  optimizer: adam
+  weight_decay: 1.0e-05
+  scheduler: plateau
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+  scheduler_min_lr: 1.0e-06
+  max_norm: 1.0
+  use_layer_norm: false
+  seed: 42
+  train_dynamics: true
+  train_reward: true
+testing:
+  num_samples: 1
+  planning_horizon: 5
+  planning_samples: 1
+  batch_size: 128
+  use_val_data: false
+  use_test_data: true
+wandb:
+  use_wandb: true
+  project: pldm-overcooked
+  name: random_search_50
+  entity: harshsutariya1179
+  watch_model: true
+  save_model: true
+probing:
+  targets:
+  - agent_pos
+  - reward
+  probe_dynamics: true
+  probe_reward: false
+  batch_size: 64
+  epochs: 20
+  lr: 0.001
+  val_ratio: 0.1
+  test_ratio: 0.1
+  visualize: false
+  max_vis_samples: 10
+  probe_encoder: true
+  probe_predictor: true
+  state_channels:
+    arch: mlp
+    hidden_dims:
+    - 128
+    - 64
+  agent_pos:
+    arch: mlp
+    hidden_dims:
+    - 128
+    - 64
+  reward:
+    arch: mlp
+    hidden_dims:
+    - 64
+    - 32
+  save_weights: true
+  save_visualizations: true
