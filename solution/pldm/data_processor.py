@@ -94,6 +94,38 @@ def custom_collate_fn(batch, return_terminal: bool = False):
     return batched_states, batched_actions, batched_next_states, batched_rewards
 
 
+def reshape_tensor(tensor, target_size):
+    """
+    Reshape a single tensor to the target 2D size using padding.
+    
+    Args:
+        tensor: Input tensor of shape (channels, height, width)
+        target_size: Tuple of (target_height, target_width)
+        
+    Returns:
+        Reshaped tensor of shape (channels, target_height, target_width)
+    """
+    # Extract target dimensions
+    target_height, target_width = target_size
+    
+    # Get current dimensions
+    channels, height, width = tensor.size()
+    
+    # Calculate padding needed
+    pad_height = max(0, target_height - height)
+    pad_width = max(0, target_width - width)
+    
+    # Apply padding if needed
+    if pad_height > 0 or pad_width > 0:
+        # Padding format: (left, right, top, bottom, front, back)
+        padding = (0, pad_width, 0, pad_height, 0, 0)
+        reshaped_tensor = torch.nn.functional.pad(tensor, padding)
+    else:
+        reshaped_tensor = tensor
+    
+    return reshaped_tensor
+
+
 class OvercookedDataset(Dataset):
     """
     Dataset for Overcooked transitions (state, action, next_state, reward).

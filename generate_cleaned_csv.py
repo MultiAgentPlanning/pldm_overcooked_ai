@@ -5,7 +5,7 @@ import numpy as np
 
 # Step 1: Load CSV safely
 df = pd.read_csv(
-    "2019_hh_trials.csv",
+    "data/raw/2019_hh_trials.csv",
     on_bad_lines='skip',  # skips badly formed rows
     encoding='utf-8',
     engine='python'

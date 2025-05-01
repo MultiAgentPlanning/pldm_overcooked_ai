@@ -9,6 +9,7 @@ from .state_encoder import GridStateEncoder, VectorStateEncoder
 from .dynamics_predictor import GridDynamicsPredictor, VectorDynamicsPredictor
 from .reward_predictor import GridRewardPredictor, VectorRewardPredictor
 from .utils import set_seeds
+from .data_processor import reshape_tensor
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -20,8 +21,9 @@ class Planner:
     """
     def __init__(self,
                  dynamics_model: torch.nn.Module,
-                 reward_model: torch.nn.Module,
+                 reward_model,
                  state_encoder, # Should be GridStateEncoder or VectorStateEncoder instance
+                 state_encoder_net: torch.nn.Module,
                  num_actions: int = 6,
                  planning_horizon: int = 10,
                  num_samples: int = 100,
@@ -45,6 +47,7 @@ class Planner:
         self.dynamics_model = dynamics_model
         self.reward_model = reward_model
         self.state_encoder = state_encoder
+        self.state_encoder_net = state_encoder_net
         self.num_actions = num_actions
         self.horizon = planning_horizon
         self.num_samples = num_samples
@@ -88,7 +91,7 @@ class Planner:
 
         # Ensure models are on the correct device and in eval mode
         self.dynamics_model.to(self.device).eval()
-        self.reward_model.to(self.device).eval()
+        # self.reward_model.to(self.device).eval()
 
         logger.info(f"Planner initialized with horizon={self.horizon}, samples={self.num_samples} on device={self.device}")
 
@@ -156,16 +159,21 @@ class Planner:
             # Encode the initial state
             current_state_encoded = self.state_encoder.encode(current_state_dict)
             current_state_tensor = torch.tensor(current_state_encoded, dtype=torch.float32, device=self.device)
+            current_state_tensor = reshape_tensor(current_state_tensor, (13, 14))
+            current_state_tensor = self.state_encoder_net(current_state_tensor.unsqueeze(0)) # Add batch dimension
+            print(f"current_state_tensor shape: {current_state_tensor.shape}")
         except Exception as e:
             logger.error(f"Error encoding initial state: {e}")
             raise # Re-raise exception as simulation cannot proceed
 
         # Repeat the initial state for each sampled trajectory
         # Shape: [num_samples, channels, height, width] or [num_samples, state_dim]
-        if current_state_tensor.dim() == 3: # Grid state
-             current_states_batch = current_state_tensor.unsqueeze(0).repeat(batch_size, 1, 1, 1)
-        elif current_state_tensor.dim() == 1: # Vector state
-             current_states_batch = current_state_tensor.unsqueeze(0).repeat(batch_size, 1)
+        if current_state_tensor.dim() == 4: # Grid state
+             current_states_batch = current_state_tensor.repeat(batch_size, 1, 1, 1)
+        if current_state_tensor.dim() == 3: # 2D state
+             current_states_batch = current_state_tensor.repeat(batch_size, 1, 1)
+        elif current_state_tensor.dim() == 2: # Vector state
+             current_states_batch = current_state_tensor.repeat(batch_size, 1)
         else:
             logger.error(f"Unexpected initial state tensor dimension: {current_state_tensor.dim()}")
             raise ValueError("Initial state tensor has unexpected dimensions.")
@@ -180,7 +188,7 @@ class Planner:
 
             try:
                 # Predict reward for the current state and action
-                predicted_rewards = self.reward_model(current_states_batch, current_actions)
+                predicted_rewards = self.reward_model(current_states_batch, (current_actions[0] * 6) + current_actions[1])
                 if predicted_rewards.dim() > 1:
                      predicted_rewards = predicted_rewards.squeeze(-1) # Remove trailing dimension if exists
                 total_rewards += predicted_rewards
@@ -223,13 +231,7 @@ class Planner:
         action_sequences = self._sample_action_sequences() # Shape: [num_samples, horizon, 2]
 
         # 2. Simulate trajectories and get cumulative rewards
-        try:
-            cumulative_rewards = self._simulate_trajectories(current_state_dict, action_sequences) # Shape: [num_samples]
-        except Exception as sim_err:
-            logger.error(f"Trajectory simulation failed: {sim_err}. Cannot plan.")
-            # Return a default action (e.g., STAY) and zero reward if planning fails
-            return np.array([0, 0], dtype=np.int64), 0.0 
-
+        cumulative_rewards = self._simulate_trajectories(current_state_dict, action_sequences) # Shape: [num_samples]
 
         # 3. Compute costs (negative rewards)
         costs = -cumulative_rewards  # [num_samples]
