@@ -33,13 +33,16 @@ def _find_model_file(path: str | Path, step: int | None) -> Path:
     raise FileNotFoundError(f"model_{step}.d3 not found in {p}")
 
 
-def _load_encoder(csv_path, pldm_dir, device, seed):
+def _load_encoder(csv_path, pldm_dir, device, seed, trainer=None):
     cfg = load_config(Path(pldm_dir, "training_config.yaml"))
-    tr = PLDMTrainer(csv_path, "/tmp", cfg["model"]["type"], 1, 1e-4,
-                     cfg["model"]["state_embed_dim"], cfg["model"]["action_embed_dim"],
-                     cfg["model"]["num_actions"], cfg["model"]["dynamics_hidden_dim"],
-                     cfg["model"]["reward_hidden_dim"], device=device,
-                     disable_artifacts=True, config=cfg, seed=seed)
+    if trainer is None:
+        tr = PLDMTrainer(csv_path, "/tmp", cfg["model"]["type"], 1, 1e-4,
+                        cfg["model"]["state_embed_dim"], cfg["model"]["action_embed_dim"],
+                        cfg["model"]["num_actions"], cfg["model"]["dynamics_hidden_dim"],
+                        cfg["model"]["reward_hidden_dim"], device=device,
+                        disable_artifacts=True, config=cfg, seed=seed)
+    else:
+        tr = trainer
     tr._initialize_models()
     enc = tr.cnn_encoder.to(device)
     enc(next(iter(tr.train_loader))[0][:1].to(device))
@@ -51,11 +54,11 @@ def _load_encoder(csv_path, pldm_dir, device, seed):
 class OvercookedValueEstimator:
     """Q / V estimator for Overcooked grid states."""
     def __init__(self, model_path_or_dir, csv_path, pldm_dir,
-                 num_actions=6, step=None, device="cpu", seed=0):
+                 num_actions=6, step=None, device="cpu", seed=0, trainer=None):
         self.device = device
         self.N = num_actions
         self.Ntot = num_actions * num_actions
-        self.encoder = _load_encoder(csv_path, pldm_dir, device, seed)
+        self.encoder = _load_encoder(csv_path, pldm_dir, device, seed, trainer=trainer)
         ckpt = _find_model_file(model_path_or_dir, step)
         print(f"[info] using checkpoint {ckpt}")
         self.policy = d3rlpy.load_learnable(ckpt, device=("cuda:0" if device == "cuda" else "cpu"))
@@ -109,3 +112,9 @@ if __name__ == "__main__":
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     demo(ap.parse_args())
+
+
+
+
+# s0, mppi -> 100 * trajectories, metric(sT) 
+# pushT -> sT how close to goal

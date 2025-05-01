@@ -23,6 +23,15 @@ ACTION_INDICES = {
     INTERACT: 5
 }
 
+ACTION_INDICES_REVERSE = {
+    0: STAY,
+    1: UP,
+    2: DOWN,
+    3: LEFT,
+    4: RIGHT,
+    5: INTERACT
+}
+
 # Layout element mapping
 LAYOUT_ELEMENTS = {
     'X': 'wall',
