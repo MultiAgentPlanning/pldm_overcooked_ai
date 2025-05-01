@@ -4,6 +4,7 @@ import json
 import torch
 import numpy as np
 import pandas as pd
+from functools import partial
 from torch.utils.data import Dataset, DataLoader, random_split
 from typing import Dict, List, Tuple, Union, Optional
 import logging # Import logging
@@ -16,7 +17,7 @@ from .state_encoder import GridStateEncoder, VectorStateEncoder
 logger = logging.getLogger(__name__)
 
 # Custom collate function to handle tensors of different sizes
-def custom_collate_fn(batch):
+def custom_collate_fn(batch, return_terminal: bool = False):
     """
     Custom collate function that handles tensors of different sizes.
     For grid states, it pads all tensors to the maximum size in the batch.
@@ -28,7 +29,10 @@ def custom_collate_fn(batch):
         Tuple of batched tensors
     """
     # Separate the batch into components
-    states, actions, next_states, rewards = zip(*batch)
+    if return_terminal:
+        states, actions, next_states, rewards, terms = zip(*batch)
+    else:
+        states, actions, next_states, rewards = zip(*batch)
     
     # Check if we have grid or vector states
     if states[0].dim() == 3:  # Grid states (channels, height, width)
@@ -83,6 +87,10 @@ def custom_collate_fn(batch):
     batched_actions = torch.stack(actions)
     batched_rewards = torch.stack(rewards)
     
+    if return_terminal:
+        batched_terms = torch.stack(terms)
+        return batched_states, batched_actions, batched_next_states, batched_rewards, batched_terms
+    
     return batched_states, batched_actions, batched_next_states, batched_rewards
 
 
@@ -94,7 +102,8 @@ class OvercookedDataset(Dataset):
     def __init__(self, 
                  data_path: str,
                  state_encoder_type: str = 'grid',
-                 max_samples: Optional[int] = None):
+                 max_samples: Optional[int] = None,
+                 return_terminal: bool = False):
         """
         Initialize the dataset.
         
@@ -121,6 +130,12 @@ class OvercookedDataset(Dataset):
         self.episode_info = [] # List to store (start_idx, end_idx, trial_id)
         self._load_data(max_samples)
         logger.info(f"Loaded {len(self.transitions)} transitions across {len(self.episode_info)} episodes.")
+        
+        self.return_terminal = return_terminal
+        if self.return_terminal:
+            self.terminals = np.zeros(len(self.transitions), dtype=np.float32)
+            for start_idx, end_idx, _ in self.episode_info:
+                self.terminals[end_idx] = 1.0
     
     def _load_data(self, max_samples: Optional[int] = None):
         """
@@ -293,6 +308,10 @@ class OvercookedDataset(Dataset):
         next_state_tensor = torch.tensor(next_state_enc, dtype=torch.float32)
         reward_tensor = torch.tensor(reward, dtype=torch.float32) 
         
+        if self.return_terminal:
+            term_tensor = torch.tensor(self.terminals[idx], dtype=torch.float32)
+            return state_tensor, action_tensor, next_state_tensor, reward_tensor, term_tensor
+        
         return state_tensor, action_tensor, next_state_tensor, reward_tensor
 
 
@@ -302,6 +321,7 @@ def get_overcooked_dataloaders(data_path: str,
                                val_ratio: float = 0.1,
                                test_ratio: float = 0.1,
                                max_samples: Optional[int] = None,
+                               return_terminal: bool = False,
                                num_workers: int = 4,
                                seed: Optional[int] = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
@@ -321,7 +341,7 @@ def get_overcooked_dataloaders(data_path: str,
         Tuple of (train_loader, val_loader, test_loader)
     """
     # Create dataset
-    dataset = OvercookedDataset(data_path, state_encoder_type, max_samples)
+    dataset = OvercookedDataset(data_path, state_encoder_type, max_samples, return_terminal)
     
     # Handle empty dataset case
     if len(dataset) == 0:
@@ -349,13 +369,15 @@ def get_overcooked_dataloaders(data_path: str,
     logger.info(f"Dataset split: {len(train_dataset)} train, {len(val_dataset)} validation, {len(test_dataset)} test samples")
     
     # Create dataloaders with custom collate function
+    collate = partial(custom_collate_fn, return_terminal=return_terminal)
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=custom_collate_fn
+        collate_fn=collate
     )
     
     val_loader = DataLoader(
@@ -364,7 +386,7 @@ def get_overcooked_dataloaders(data_path: str,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=custom_collate_fn
+        collate_fn=collate
     )
     
     test_loader = DataLoader(
@@ -373,7 +395,7 @@ def get_overcooked_dataloaders(data_path: str,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=custom_collate_fn
+        collate_fn=collate
     )
     
-    return train_loader, val_loader, test_loader 
+    return train_loader, val_loader, test_loader

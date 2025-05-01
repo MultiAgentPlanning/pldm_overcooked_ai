@@ -1,4 +1,3 @@
-# ----  solution/value/algos.py  ----------------------------------------
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any
@@ -6,10 +5,9 @@ from typing import Tuple, Dict, Any
 import d3rlpy
 from d3rlpy.models.q_functions import QFunctionFactory
 from d3rlpy.models.torch.q_functions import DiscreteMeanQFunctionForwarder
-from d3rlpy.models.encoders import PixelEncoderFactory
 
 from solution.value.model import QValueNet
-from solution.value.config import SUPPORTED_ALGORITHMS, CNN_FILTERS, CNN_FEATURE_SIZE
+from solution.value.config import SUPPORTED_ALGORITHMS
 
 
 @dataclass
@@ -33,8 +31,6 @@ class CustomQFactory(QFunctionFactory):
         return "custom_pixel_q"
 
     def get_params(self, deep: bool = False) -> Dict[str, Any]:
-        # These two keys will be fed back into __init__
-        # The obs_shape needs to be a list to be JSON serializable
         return {
             "obs_shape": list(self.obs_shape) if self.obs_shape is not None else None,
             "share_encoder": self.share_encoder,
@@ -45,28 +41,13 @@ def get_algo_config(algo_name: str, obs_shape, args):
     AlgoCfg = SUPPORTED_ALGORITHMS[algo_name]
     cfg = AlgoCfg()
 
-    pixel_encoder = PixelEncoderFactory(
-        filters=CNN_FILTERS,
-        feature_size=CNN_FEATURE_SIZE,
-        use_batch_norm=args.use_batch_norm,
-    )
-
-    cfg.encoder_factory = pixel_encoder
-    
-    # For algorithms that have separate actor and critic encoders
-    if hasattr(cfg, 'actor_encoder_factory'):
-        cfg.actor_encoder_factory = pixel_encoder
-    if hasattr(cfg, 'critic_encoder_factory'):
-        cfg.critic_encoder_factory = pixel_encoder
-
+    # Use default encoder for 1-D observations
     cfg.q_func_factory = CustomQFactory(tuple(obs_shape))
 
-    # Common parameters for all algorithms
     cfg.batch_size = args.batch_size
     cfg.learning_rate = args.learning_rate
     cfg.gamma = args.gamma
     
-    # Algorithm-specific parameters
     if algo_name == "cql":
         cfg.alpha = args.cql_alpha
     elif algo_name == "bcq":
