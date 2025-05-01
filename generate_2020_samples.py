@@ -6,7 +6,7 @@ from solution.pldm.data_processor import OvercookedDataset  # Replace with actua
 
 
 def get_validation_dataframe(data_path: str,
-                             seed = 101,
+                             seed = 42,
                              state_encoder_type: str = 'grid',
                              val_ratio: float = 0.1,
                              test_ratio: float = 0.1,
@@ -46,7 +46,7 @@ def main():
         data_path="data/raw/2020_hh_trials.csv"
     )
 
-    val_df.to_csv("2020_samples.csv", index=False)
+    val_df.to_csv("2020_samples_42.csv", index=False)
 
 if __name__ == "__main__":
     main()
