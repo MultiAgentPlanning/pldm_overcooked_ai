@@ -174,7 +174,7 @@ cython_debug/
 .pypirc
 
 # what we have added:
-
+*.zip
 *.csv
 *.npz
 .empty
