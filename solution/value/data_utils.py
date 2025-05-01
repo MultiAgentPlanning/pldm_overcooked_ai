@@ -91,7 +91,10 @@ def pad_grid(grid: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
 
 # --- Main Data Processing Function (with Caching) ---
 
-def process_data(df: pd.DataFrame, H_global_max: int, W_global_max: int, cache_dir: str = "./data/") -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def process_data(df: pd.DataFrame, H_global_max: int, W_global_max: int,
+                 cache_dir: str = "./data/",
+                 embedder=None,
+                 external_encoder: GridStateEncoder = None) -> Tuple[np.ndarray, ...]:    
     """
     Processes the DataFrame to extract transitions and format them for d3rlpy.
     Uses imported functions parse_state, parse_joint_action, get_action_index.
@@ -176,19 +179,25 @@ def process_data(df: pd.DataFrame, H_global_max: int, W_global_max: int, cache_d
                 try:
                     # State Parsing and Encoding
                     curr_state_dict = parse_state(current_row['state'])
-                    state_grid = encoder.encode(curr_state_dict)
+                    state_grid = (external_encoder or encoder).encode(curr_state_dict)
                     if state_grid.shape[0] != num_channels_expected:
                          raise ValueError(f"Encoder channel mismatch: {state_grid.shape[0]} vs {num_channels_expected}")
-                    padded_state = pad_grid(state_grid, H_global_max, W_global_max)
-                    observations.append(padded_state.astype(np.float32))
+                    if embedder is not None:
+                        observations.append(embedder(state_grid))
+                    else:
+                        padded_state = pad_grid(state_grid, H_global_max, W_global_max)
+                        observations.append(padded_state.astype(np.float32))
 
                     # Next State Parsing and Encoding
                     next_state_dict = parse_state(next_row['state'])
-                    next_state_grid = encoder.encode(next_state_dict)
+                    next_state_grid = (external_encoder or encoder).encode(next_state_dict)
                     if next_state_grid.shape[0] != num_channels_expected:
                          raise ValueError(f"Encoder channel mismatch (next): {next_state_grid.shape[0]} vs {num_channels_expected}")
-                    padded_next_state = pad_grid(next_state_grid, H_global_max, W_global_max)
-                    next_observations.append(padded_next_state.astype(np.float32))
+                    if embedder is not None:
+                        next_observations.append(embedder(next_state_grid))
+                    else:
+                        padded_next_state = pad_grid(next_state_grid, H_global_max, W_global_max)
+                        next_observations.append(padded_next_state.astype(np.float32))
 
                     # Action Parsing and Mapping
                     parsed_action_pair = parse_joint_action(current_row['joint_action'])

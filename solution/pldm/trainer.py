@@ -254,6 +254,7 @@ class PLDMTrainer:
 
         # --- State Encoder Initialization ---
         model_config = self.config.get("model", {})
+        print(f"state_encoder: {self.state_encoder}")
         if self.state_encoder is None: # Only initialize if not provided externally
             if self.model_type == "grid":
                 # Always start with GridStateEncoder for grid models
