@@ -110,6 +110,9 @@ def reshape_tensor(tensor, target_size):
     
     # Get current dimensions
     channels, height, width = tensor.size()
+
+    assert target_height >= height and target_width >= width, \
+        f"Target size {target_size} must be greater than or equal to current size {(channels, height, width)}"
     
     # Calculate padding needed
     pad_height = max(0, target_height - height)

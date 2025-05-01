@@ -52,7 +52,10 @@ def main(args):
 
     # In the main function, right after creating the planner
     # Set up CSV logging
-    csv_filename = os.path.join(args.output_dir, "simulation_log_2020.csv")
+    # csv_filename = os.path.join(args.output_dir, "simulation_log_2020_42_v3.csv")
+    csv_filename = os.path.join(args.output_dir, 
+        f"simulation_log_{args.csv_path.split('/')[-1].split('_')[0]}_{args.pldm_dir.split('/')[-1]}_{args.reward_model_path.split('/')[-1]}_PH{args.planning_horizon}_NS{args.num_samples}_MS{args.max_steps}_LT{args.lambda_temp}.csv"
+    )
     os.makedirs(args.output_dir, exist_ok=True)
     csv_headers = [
         "sample_idx",
@@ -74,7 +77,7 @@ def main(args):
             writer.writeheader()
 
     # Reading start states
-    df = pd.read_csv("2020_samples_unique_100.csv")
+    df = pd.read_csv(args.start_states_csv)
     # ---- seeding ----
     d3rlpy.seed(args.seed)
     np.random.seed(args.seed)
@@ -152,6 +155,7 @@ def main(args):
         state_encoder_net=state_encoder_net,
         planning_horizon=args.planning_horizon,
         lambda_temp=args.lambda_temp,
+        num_samples=args.num_samples,
         device=device,
         seed=args.seed,
     )
@@ -163,10 +167,12 @@ def main(args):
         print("----------------------------")
         layout_name = row["layout_name"]
         layout = ast.literal_eval(row["layout"])
-        state_dict = ast.literal_eval(row["state"])
+        state_dict = json.loads(row["state"])
+        # state_dict = ast.literal_eval(row["state"])
 
         mdp = OvercookedGridworld.from_layout_name(layout_name)
         state = OvercookedState.from_dict(state_dict)
+        state.timestep = 0
         mdp_fn = lambda _info=None: mdp
 
         # Create env
@@ -185,6 +191,8 @@ def main(args):
         # print('converted action:' + convert_action_vector_to_symbol([0,-1]))
 
         # print('converted action:' + convert_action_vector_to_symbol('interact'))
+
+        R = 0
 
         for i in range(args.max_steps):
 
@@ -218,10 +226,12 @@ def main(args):
 
             # Step
             state, reward, done, info = env.step((a0, a1))
+            R += reward
 
             print(f"\nStep {i+1}:")
             # print("State:\n", str(env.state.to_dict()))
             print("Reward:", reward)
+            print("Total Reward:", R)
             print("Done:", done)
             print("Num Dones:", num_dones)
             print("Info:", info)
@@ -250,11 +260,13 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("csv_path")
-    p.add_argument("output_dir")
-    p.add_argument("--planning_horizon", type=float, default=10)
+    p.add_argument("--csv_path")
+    p.add_argument("--start_states_csv")
+    p.add_argument("--output_dir")
+    p.add_argument("--planning_horizon", type=int, default=10)
     p.add_argument("--max_steps", type=int, default=1000)
     p.add_argument("--lambda_temp", type=float, default=1)
+    p.add_argument("--num_samples", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gpu", action="store_true")
     p.add_argument(

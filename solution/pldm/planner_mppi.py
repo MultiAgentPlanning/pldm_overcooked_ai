@@ -159,9 +159,11 @@ class Planner:
             # Encode the initial state
             current_state_encoded = self.state_encoder.encode(current_state_dict)
             current_state_tensor = torch.tensor(current_state_encoded, dtype=torch.float32, device=self.device)
-            current_state_tensor = reshape_tensor(current_state_tensor, (13, 14))
+            # print(f"current_state_tensor shape: {current_state_tensor.shape}")
+            current_state_tensor = reshape_tensor(current_state_tensor, (14, 13))
+            # print(f"current_state_tensor shape: {current_state_tensor.shape}")
             current_state_tensor = self.state_encoder_net(current_state_tensor.unsqueeze(0)) # Add batch dimension
-            print(f"current_state_tensor shape: {current_state_tensor.shape}")
+            # print(f"current_state_tensor shape: {current_state_tensor.shape}")
         except Exception as e:
             logger.error(f"Error encoding initial state: {e}")
             raise # Re-raise exception as simulation cannot proceed

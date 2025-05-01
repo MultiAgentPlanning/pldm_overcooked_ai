@@ -1,7 +1,7 @@
 import pandas as pd
 
 # Load cleaned CSV
-df = pd.read_csv("2020_samples.csv")
+df = pd.read_csv("2020_samples_42.csv")
 
 # Step 0: Filter out unwanted layouts
 # df = df[~df['layout_name'].isin(['random3', 'random0'])]
@@ -14,5 +14,5 @@ n = min(100, len(df_unique_states))
 sampled_df = df_unique_states.sample(n=n, random_state=42).reset_index(drop=True)
 
 # Step 3: Save the result
-sampled_df.to_csv("2020_samples_unique_100.csv", index=False)
+sampled_df.to_csv("2020_samples_unique_100_42.csv", index=False)
 # print(f"Saved {n} unique state rows to 'sampled_unique_states_100.csv' (excluding random0 and random3)")
