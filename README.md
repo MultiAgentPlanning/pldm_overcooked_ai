@@ -6,7 +6,7 @@
 
 In this work, we systematically evaluate a **Latent Dynamics Model**, trained on offline human-generated trajectories within the **Overcooked-AI** cooperative environment. We combine latent dynamics modeling with **Model Predictive Path Integral (MPPI)** style planning and compare it against a planning-free baseline. Our experiments reveal that although our approach improves on the greedy baseline, it significantly trails expert-level performance. We identify critical challenges, including sparse reward feedback and cumulative prediction errors during long-horizon planning. Our findings underscore that while latent dynamics-based planning shows promise in data-efficient generalization and improved cooperative decision making from limited offline data, substantial opportunities remain for enhancing model accuracy and planning efficacy in highly cooperative and sparse reward scenarios.
 
-![trajectory.gif](attachment:347a172d-1c64-4f89-b7c1-6578c1dc20dd:trajectory.gif)
+![alt text](image-1.png)
 
 ## Background & Motivation
 
@@ -26,7 +26,7 @@ However, the relative effectiveness of these approaches, particularly when using
 - JEPA-style latent dynamics model trained using offline trajectories.
 - Learned representation aimed to capture environment dynamics effectively from sparse, discrete state-action data.
 
-![overcooked_train.drawio.png](attachment:e86b285f-5a13-4508-a68c-85c27a6dab10:overcooked_train.drawio.png)
+![alt text](image-2.png)
 
 ---
 
@@ -35,7 +35,7 @@ However, the relative effectiveness of these approaches, particularly when using
 - Trained a Q-value predictor to evaluate state-action pairs within the learned latent space.
 - Used MPPI-based planning to generate trajectories by simulating actions based on the learned dynamics model.
 
-![overcooked_plan.drawio.png](attachment:e36b2a90-9691-431a-991a-b8e3d950ca14:overcooked_plan.drawio.png)
+![alt text](image-3.png)
 
 ---
 
@@ -50,11 +50,11 @@ However, the relative effectiveness of these approaches, particularly when using
 
 ## Environments and Datasets
 
-![game_layout.gif](attachment:eaa5b553-2d74-4326-bef4-84c73bfbb74f:game_layout.gif)
+![alt text](image-4.png)
 
 - **Environment**: Overcooked-AI — a cooperative multi-agent simulation where two agents coordinate to prepare and deliver dishes in a shared kitchen.
 
-![actions.jpg](attachment:107842b0-06ff-4990-8cac-7adfda6a1b13:actions.jpg)
+![alt text](image-5.png)
 
 - **Dataset**: Expert trajectories from human-human interactions.
     - Stored as DataFrames containing:
@@ -64,7 +64,7 @@ However, the relative effectiveness of these approaches, particularly when using
 
 Each trajectory represents a sequence of cooperative actions culminating in high rewards.
 
-![jsontree.png](attachment:d1641252-e7b7-478a-9fdb-6d82f1473a08:jsontree.png)
+![alt text](image-6.png)
 
 ---
 
