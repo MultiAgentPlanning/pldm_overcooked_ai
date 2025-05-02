@@ -1,9 +1,128 @@
-## Harsh
+# Latent Dynamics Planning for Cooperative MARL in Overcooked-AI
 
-python solution/train_pldm.py --config solution/configs/default_grid_config.yaml
+### Harsh Sutaria | Kevin Mathew | Ayush Rajesh Jhaveri | Tiasa Singha Roy
 
-## Kevin
+## Abstract
 
-python solution/train_pldm.py --config solution/configs/default_grid_config.yaml --data=data/raw/2020_hh_trials.csv
-python -m solution.value.train_value data/raw/2020_hh_trials.csv discrete_sac --gpu
-python -m solution.run_experiments data/raw/2020_hh_trials.csv data/output_dir --max_steps 500 --pldm_dir data/pldm --gpu --reward_model_path d3rlpy_logs/overcooked_discrete_sac_20250430193519
+In this work, we systematically evaluate a **Latent Dynamics Model**, trained on offline human-generated trajectories within the **Overcooked-AI** cooperative environment. We combine latent dynamics modeling with **Model Predictive Path Integral (MPPI)** style planning and compare it against a planning-free baseline. Our experiments reveal that although our approach improves on the greedy baseline, it significantly trails expert-level performance. We identify critical challenges, including sparse reward feedback and cumulative prediction errors during long-horizon planning. Our findings underscore that while latent dynamics-based planning shows promise in data-efficient generalization and improved cooperative decision making from limited offline data, substantial opportunities remain for enhancing model accuracy and planning efficacy in highly cooperative and sparse reward scenarios.
+
+![trajectory.gif](attachment:347a172d-1c64-4f89-b7c1-6578c1dc20dd:trajectory.gif)
+
+## Background & Motivation
+
+A key challenge in cooperative multi-agent reinforcement learning (MARL) is developing agents capable of coordinating effectively in complex environments from limited offline data. Two primary approaches to address this are:
+
+- model-free methods that learn directly from experiences using value-based policies
+- model-based planning methods, which leverage learned latent dynamics to predict future states and optimize decisions.
+
+However, the relative effectiveness of these approaches, particularly when using offline expert trajectories in sparse reward, cooperative scenarios, remains under-explored.
+
+---
+
+## Training and Planning with Dynamics Model
+
+### Stage 1: Latent Dynamics Training
+
+- JEPA-style latent dynamics model trained using offline trajectories.
+- Learned representation aimed to capture environment dynamics effectively from sparse, discrete state-action data.
+
+![overcooked_train.drawio.png](attachment:e86b285f-5a13-4508-a68c-85c27a6dab10:overcooked_train.drawio.png)
+
+---
+
+### Stage 2: Q-Value Model Training
+
+- Trained a Q-value predictor to evaluate state-action pairs within the learned latent space.
+- Used MPPI-based planning to generate trajectories by simulating actions based on the learned dynamics model.
+
+![overcooked_plan.drawio.png](attachment:e36b2a90-9691-431a-991a-b8e3d950ca14:overcooked_plan.drawio.png)
+
+---
+
+### Stage 3: MPPI Style Planning
+
+- Although MPPI is typically used for continuous control, we use its adapted version for **discrete action spaces**.
+- Randomly sampled multiple action trajectories.
+- Used cumulative predicted Q-values as weights.
+- At each timestep, aggregated Q-values and selected the action with the highest corresponding value.
+
+---
+
+## Environments and Datasets
+
+![game_layout.gif](attachment:eaa5b553-2d74-4326-bef4-84c73bfbb74f:game_layout.gif)
+
+- **Environment**: Overcooked-AI — a cooperative multi-agent simulation where two agents coordinate to prepare and deliver dishes in a shared kitchen.
+
+![actions.jpg](attachment:107842b0-06ff-4990-8cac-7adfda6a1b13:actions.jpg)
+
+- **Dataset**: Expert trajectories from human-human interactions.
+    - Stored as DataFrames containing:
+        - State transitions
+        - Joint actions
+        - Rewards
+
+Each trajectory represents a sequence of cooperative actions culminating in high rewards.
+
+![jsontree.png](attachment:d1641252-e7b7-478a-9fdb-6d82f1473a08:jsontree.png)
+
+---
+
+## Experimental Setup
+
+- Implemented **VICReg-style loss** to prevent representation collapse.
+- Fine-tuned VICReg parameters via **Random Grid Search** (100 trials).
+- MPPI-based planning hyperparameters:
+    - Explored various combinations of:
+        - **Planning horizon** (length of rollout)
+        - **Number of samples** (rollouts per step)
+
+---
+
+## Results
+
+| **Model / Method** | **Avg. Reward** |
+| --- | --- |
+| Expert Performance | ~150 |
+| Greedy Baseline | 13 |
+| PLDM + MPPI Planning | 26 |
+- Configuration: `num_samples = 100`, `planning_horizon = 10`
+
+Although the latent dynamics model improved performance over the greedy baseline, it still lags behind human-level coordination.
+
+---
+
+## Summary
+
+While PLDM-based latent state modeling combined with MPPI-style planning demonstrates **potential in cooperative MARL**, a **significant performance gap** remains when compared to human-level performance.
+
+### Key Takeaways
+
+- **Sparse Rewards Challenge**:
+    
+    Sparse rewards severely limit planning feedback. Denser reward signals or shaping are needed.
+    
+- **Model Prediction Errors**:
+    
+    Inaccuracies in the dynamics model lead to **cumulative error** in multi-step rollout.
+    
+- **Planning Horizon and Sampling**:
+    
+    More accurate shorter horizons may outperform long horizons.
+    
+    **Effective sampling** is critical.
+    
+- **Enhanced Exploration Strategies**:
+    
+    Techniques like **intrinsic motivation** or **curiosity-driven rewards** could help in sparse-reward settings.
+    
+
+---
+
+## Future Work
+
+- Improve latent dynamics **model accuracy**
+- Incorporate **denser reward feedback**
+- Optimize **MPPI sampling and rollout strategy**
+- Explore **representation regularization** for generalization
+- Consider **multi-goal inference and attention-based planning**
